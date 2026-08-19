@@ -122,7 +122,8 @@ func (t *Socks5UDPTransport) Connect(ctx context.Context) error {
 		return err
 	}
 
-	udpConn, err := net.ListenUDP("udp", resolveUDPAddrOrNil(t.localAddr))
+	// 监听 IPv4：SOCKS5 代理与 ePDG 均为 IPv4，避免绑定 [::] 双栈 socket 导致中继不被接受
+	udpConn, err := net.ListenUDP("udp4", resolveUDPAddrOrNil(t.localAddr))
 	if err != nil {
 		_ = control.Close()
 		return fmt.Errorf("socks5 中继 UDP socket 建立失败: %w", err)
