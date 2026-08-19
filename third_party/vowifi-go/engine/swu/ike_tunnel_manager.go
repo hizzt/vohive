@@ -291,6 +291,9 @@ func (m *IKEPacketTunnelManager) transportConfigs(cfg TunnelConfig, epdg string)
 		remotePort = 500 // IKE 标准端口；NAT-T (4500) 在检测到 NAT 后切换
 	}
 	localPort := m.Config.LocalPort
+	if localPort == 0 {
+		localPort = 500 // IKE 标准端口；NAT-D 载荷需要非零端口
+	}
 	localIP := normalizedMOBIKEIP(m.Config.LocalIP, cfg.OuterLocalIP)
 	remoteIP := normalizedMOBIKEIP(m.Config.RemoteIP, tunnelAddressHost(epdg))
 	// 若未配置本端 IP，选取默认路由接口的 IP（NAT 检测载荷需要 4 元组均有效才会生成）

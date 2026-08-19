@@ -78,10 +78,10 @@ func TestIKEPacketTunnelManagerEstablishesPacketSession(t *testing.T) {
 	if !result.MOBIKESupported || result.ChildSAIdentifier != "cafebabe/22222222" {
 		t.Fatalf("result MOBIKE/child id = %+v", result)
 	}
-if gotIKETransport.RemoteAddr != "198.18.0.38:500" || gotIKETransport.LocalAddr != "192.0.2.10:0" || gotIKETransport.UseNonESPMarker {
+if gotIKETransport.RemoteAddr != "198.18.0.38:500" || gotIKETransport.LocalAddr != "192.0.2.10:500" || gotIKETransport.UseNonESPMarker {
 			t.Fatalf("IKE transport=%+v", gotIKETransport)
 		}
-		if gotESPTransport.RemoteAddr != "198.18.0.38:500" || gotESPTransport.LocalAddr != "192.0.2.10:0" {
+		if gotESPTransport.RemoteAddr != "198.18.0.38:500" || gotESPTransport.LocalAddr != "192.0.2.10:500" {
 			t.Fatalf("ESP transport=%+v", gotESPTransport)
 		}
 		if gotInit.Transport != ikeTransport || gotInit.RemotePort != 500 {
