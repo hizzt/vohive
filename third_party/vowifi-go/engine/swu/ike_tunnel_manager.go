@@ -19,6 +19,11 @@ import (
 
 var ErrInvalidIKETunnelManager = errors.New("invalid swu ike tunnel manager")
 
+// socks5ProxyEnabled 判断隧道配置是否需要走 SOCKS5 前置代理（否则直连 ePDG）。
+func socks5ProxyEnabled(p *ProxyConfig) bool {
+	return p != nil && p.Enabled && strings.TrimSpace(p.Addr) != ""
+}
+
 type IKEInitRunner func(context.Context, ikev2.InitConfig) (ikev2.InitResult, error)
 
 type IKEAuthRunner func(context.Context, ikev2.FullAuthConfig) (ikev2.FullAuthResult, error)
@@ -81,6 +86,10 @@ type IKEPacketTunnelManagerConfig struct {
 
 type IKEPacketTunnelManager struct {
 	Config IKEPacketTunnelManagerConfig
+
+	// socks5Transport 在 EstablishTunnel 期间为 IKE 与 ESP 共享的 SOCKS5
+	// UDP Associate 传输层（配置了前置代理时创建，一次隧道建立只建一个会话）。
+	socks5Transport *Socks5UDPTransport
 }
 
 type IKETunnelManagerConfig = IKEPacketTunnelManagerConfig
@@ -315,6 +324,14 @@ func (m *IKEPacketTunnelManager) ikeTransport(cfg TunnelConfig, transportCfg IKE
 	if m.Config.IKETransportFactory != nil {
 		return m.Config.IKETransportFactory(cfg, transportCfg)
 	}
+	if m.socks5Transport != nil || socks5ProxyEnabled(cfg.Proxy) {
+		if m.socks5Transport == nil {
+			m.socks5Transport = NewSocks5UDPTransport(
+				*cfg.Proxy, transportCfg.RemoteAddr, transportCfg.LocalAddr, transportCfg.Timeout,
+			)
+		}
+		return m.socks5Transport, nil
+	}
 	return ikev2.UDPTransport{
 		RemoteAddr:      transportCfg.RemoteAddr,
 		LocalAddr:       transportCfg.LocalAddr,
@@ -329,6 +346,14 @@ func (m *IKEPacketTunnelManager) espTransport(cfg TunnelConfig, transportCfg ESP
 	}
 	if m.Config.ESPTransportFactory != nil {
 		return m.Config.ESPTransportFactory(cfg, transportCfg)
+	}
+	if m.socks5Transport != nil || socks5ProxyEnabled(cfg.Proxy) {
+		if m.socks5Transport == nil {
+			m.socks5Transport = NewSocks5UDPTransport(
+				*cfg.Proxy, transportCfg.RemoteAddr, transportCfg.LocalAddr, transportCfg.Timeout,
+			)
+		}
+		return m.socks5Transport, nil
 	}
 	return &UDPESPPacketTransport{
 		RemoteAddr: transportCfg.RemoteAddr,

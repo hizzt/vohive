@@ -34,13 +34,13 @@ func CanonicalICCID(iccid string) string {
 	return v
 }
 
-// DefaultCardPolicy 是新卡自动建档用的硬编码安全默认（不落配置文件）。
+// DefaultCardPolicy 是新卡自动建档用的硬编码安全默认（默认飞行，防开机注册基站）。
 func DefaultCardPolicy(iccid string) CardPolicy {
 	return CardPolicy{
 		ICCID:           CanonicalICCID(iccid),
 		NetworkEnabled:  false,
 		VoWiFiEnabled:   false,
-		AirplaneEnabled: false,
+		AirplaneEnabled: true,
 		IPVersion:       "v4",
 		APN:             "",
 		Source:          "auto",
