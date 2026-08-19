@@ -709,8 +709,8 @@ func ikeKeysUsable(keys ikev2.IKEKeys) bool {
 }
 
 // comprehensiveIKEProposal 返回包含多个提议的 IKE SA，匹配旧二进制 swu/session.go 的配置。
-// 旧二进制 IKE_SA_INIT 为 572 字节含 4 个提议，覆盖不同 DH 组和算法组合。
-// 单独的 DefaultIKEProposal（仅 Curve25519）被 ePDG 丢弃。
+// 从旧二进制抓包逐字节验证：4 个提议的 transform 必须完全一致，
+// 否则 ePDG 可能静默丢弃 IKE_SA_INIT（不回 NO_PROPOSAL_CHOSEN）。
 func comprehensiveIKEProposal() ikev2.SecurityAssociation {
 	prop := func(num uint8, dhGroup uint16) ikev2.Proposal {
 		encr := ikev2.Transform{Type: ikev2.TransformENCR, ID: ikev2.ENCR_AES_CBC,
@@ -721,20 +721,33 @@ func comprehensiveIKEProposal() ikev2.SecurityAssociation {
 		// 顺序必须匹配旧二进制：ENCR → INTEG → PRF → DH
 		return ikev2.Proposal{Number: num, ProtocolID: ikev2.ProtocolIKE, Transforms: []ikev2.Transform{encr, integ, prf, dh}}
 	}
-	propAES256SHA1 := func(num uint8, dhGroup uint16) ikev2.Proposal {
+	// 旧二进制 Proposal 2/3/4 的 DHR 值为 0x0002（MODP 1024, Oakley Group 2），
+	// 而不是我们之前用的 Curve25519(31)/ECP256(19)/MODP2048(14)。
+	propGroup2 := func(num uint8, sha1 bool) ikev2.Proposal {
+		encr := ikev2.Transform{Type: ikev2.TransformENCR, ID: ikev2.ENCR_AES_CBC,
+			Attributes: []ikev2.TransformAttribute{ikev2.KeyLengthAttribute(128)}}
+		integ := ikev2.Transform{Type: ikev2.TransformINTEG, ID: ikev2.INTEG_HMAC_SHA2_256_128}
+		prf := ikev2.Transform{Type: ikev2.TransformPRF, ID: ikev2.PRF_HMAC_SHA2_256}
+		if sha1 {
+			integ = ikev2.Transform{Type: ikev2.TransformINTEG, ID: ikev2.INTEG_HMAC_SHA1_96}
+			prf = ikev2.Transform{Type: ikev2.TransformPRF, ID: ikev2.PRF_HMAC_SHA1}
+		}
+		dh := ikev2.Transform{Type: ikev2.TransformDHRGroup, ID: 2} // MODP 1024 (Group 2)
+		return ikev2.Proposal{Number: num, ProtocolID: ikev2.ProtocolIKE, Transforms: []ikev2.Transform{encr, integ, prf, dh}}
+	}
+	propAES256SHA1Group2 := func(num uint8) ikev2.Proposal {
 		encr := ikev2.Transform{Type: ikev2.TransformENCR, ID: ikev2.ENCR_AES_CBC,
 			Attributes: []ikev2.TransformAttribute{ikev2.KeyLengthAttribute(256)}}
 		integ := ikev2.Transform{Type: ikev2.TransformINTEG, ID: ikev2.INTEG_HMAC_SHA1_96}
 		prf := ikev2.Transform{Type: ikev2.TransformPRF, ID: ikev2.PRF_HMAC_SHA1}
-		dh := ikev2.Transform{Type: ikev2.TransformDHRGroup, ID: dhGroup}
-		// 顺序：ENCR → INTEG → PRF → DH
+		dh := ikev2.Transform{Type: ikev2.TransformDHRGroup, ID: 2} // MODP 1024 (Group 2)
 		return ikev2.Proposal{Number: num, ProtocolID: ikev2.ProtocolIKE, Transforms: []ikev2.Transform{encr, integ, prf, dh}}
 	}
 	return ikev2.SecurityAssociation{Proposals: []ikev2.Proposal{
-		prop(1, ikev2.DHGroup2048BitMODP),       // Proposal 1: AES-128+SHA256+MODP 2048 (匹配 KE)
-		prop(2, ikev2.DHGroupCurve25519),         // Proposal 2: AES-128+SHA256+Curve25519
-		prop(3, ikev2.DHGroup256BitECP),          // Proposal 3: AES-128+SHA256+ECP 256
-		propAES256SHA1(4, ikev2.DHGroup2048BitMODP), // Proposal 4: AES-256+SHA1+MODP 2048
+		prop(1, ikev2.DHGroup2048BitMODP),        // Proposal 1: AES-128+SHA256+MODP 2048 (匹配 KE)
+		propGroup2(2, false),                      // Proposal 2: AES-128+SHA256+MODP 1024
+		propGroup2(3, true),                       // Proposal 3: AES-128+SHA1+MODP 1024
+		propAES256SHA1Group2(4),                   // Proposal 4: AES-256+SHA1+MODP 1024
 	}}
 }
 
