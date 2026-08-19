@@ -12,21 +12,20 @@ import (
 	"time"
 
 	"github.com/iniwex5/vowifi-go/engine/swu/ikev2"
-	"github.com/txthinking/socks5"
 )
 
 // Socks5UDPTransport 通过 SOCKS5 UDP Associate 中继 IKE/ESP 流量到 ePDG。
-// 内部使用 txthinking/socks5 库（与旧版 engine/ipsec 一致的实现路径）。
+// 使用自定义 SOCKS5 实现（兼容 ePDG 代理的 UDP 中继特性）。
 type Socks5UDPTransport struct {
-	proxyAddr  string
-	username   string
-	password   string
-	localAddr  string
-	timeout    time.Duration
+	proxyAddr string
+	username  string
+	password  string
+	localAddr string
+	timeout   time.Duration
 
 	mu       sync.Mutex
-	client   *socks5.Client
-	conn     net.Conn // UDP 关联连接（Write/Read 自动封装/解封 SOCKS5 数据报）
+	relay    *net.UDPConn
+	relayEP  *net.UDPAddr
 	closed   bool
 
 	remoteAddr string       // 当前活跃的 ePDG 地址
@@ -39,7 +38,6 @@ var _ ESPPacketReadWriteTransport = (*Socks5UDPTransport)(nil)
 var _ ESPPacketTransportCloser = (*Socks5UDPTransport)(nil)
 
 // NewSocks5UDPTransport 构造 SOCKS5 UDP Associate 传输层。
-// remoteAddrs 是候选 ePDG 地址 host:port 列表，依次尝试直到成功。
 func NewSocks5UDPTransport(proxy ProxyConfig, remoteAddrs []string, localAddr string, timeout time.Duration) *Socks5UDPTransport {
 	if len(remoteAddrs) == 0 {
 		remoteAddrs = []string{""}
@@ -67,7 +65,7 @@ func (t *Socks5UDPTransport) Connect(ctx context.Context) error {
 	if t.closed {
 		return errors.New("socks5 transport closed")
 	}
-	if t.conn != nil {
+	if t.relay != nil {
 		return nil
 	}
 	if t.proxyAddr == "" {
@@ -76,37 +74,83 @@ func (t *Socks5UDPTransport) Connect(ctx context.Context) error {
 	return t.dialAddr(ctx, t.remoteAddr)
 }
 
-// dialAddr 使用 txthinking/socks5 客户端连接到指定地址。
+// dialAddr 建立到指定 ePDG 地址的 SOCKS5 UDP Associate 会话。
 func (t *Socks5UDPTransport) dialAddr(ctx context.Context, addr string) error {
-	tc := int(t.timeout.Seconds())
-	cl, err := socks5.NewClient(t.proxyAddr, t.username, t.password, tc, tc)
+	// TCP 连接到代理，完成 SOCKS5 握手 + UDP ASSOCIATE
+	control, err := (&net.Dialer{}).DialContext(ctx, "tcp", t.proxyAddr)
 	if err != nil {
-		return fmt.Errorf("socks5 client 创建失败: %w", err)
+		return fmt.Errorf("socks5 控制连接失败: %w", err)
 	}
-	// 使用 Dial 建立 UDP associate（内部：TCP 握手 → UDP ASSOCIATE → 本地 UDP socket）
-	conn, err := cl.DialWithLocalAddr("udp", t.localAddr, addr, nil)
+	if d, ok := ctx.Deadline(); ok {
+		_ = control.SetDeadline(d)
+	} else {
+		_ = control.SetDeadline(time.Now().Add(t.timeout))
+	}
+	defer control.Close()
+
+	// 版本协商
+	methods := []byte{0x00}
+	if t.username != "" {
+		methods = []byte{0x02, 0x00}
+	}
+	if _, err := control.Write(append([]byte{0x05, byte(len(methods))}, methods...)); err != nil {
+		return fmt.Errorf("socks5 版本协商失败: %w", err)
+	}
+	resp := make([]byte, 2)
+	if err := readFull(control, resp); err != nil {
+		return fmt.Errorf("socks5 版本协商响应失败: %w", err)
+	}
+	if resp[0] != 0x05 {
+		return fmt.Errorf("socks5 版本不匹配: 0x%02x", resp[0])
+	}
+	switch resp[1] {
+	case 0x00:
+	case 0x02:
+		if err := socks5SendUserPass(control, t.username, t.password); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("socks5 认证方法不被代理接受: 0x%02x", resp[1])
+	}
+
+	// UDP ASSOCIATE
+	req := []byte{0x05, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+	if _, err := control.Write(req); err != nil {
+		return fmt.Errorf("socks5 UDP ASSOCIATE 发送失败: %w", err)
+	}
+	reply, err := socks5ReadAssociateReply(control)
 	if err != nil {
-		return fmt.Errorf("socks5 UDP associate 失败: %w", err)
+		return fmt.Errorf("socks5 UDP ASSOCIATE 回复失败: %w", err)
 	}
-	t.client = cl
-	t.conn = conn
+	relayAddr := fmt.Sprintf("%s:%d", reply.IP, reply.Port)
+	relayUDP, err := net.ResolveUDPAddr("udp", relayAddr)
+	if err != nil {
+		return fmt.Errorf("socks5 中继地址解析失败: %w", err)
+	}
+
+	// 创建 UDP socket 连接到中继端
+	udpConn, err := net.DialUDP("udp", nil, relayUDP)
+	if err != nil {
+		return fmt.Errorf("socks5 UDP 中继连接失败: %w", err)
+	}
+	t.relay = udpConn
+	t.relayEP = relayUDP
 	t.remoteAddr = addr
 	return nil
 }
 
 // ExchangeIKE 通过 SOCKS5 UDP Associate 中继一次 IKE 请求-响应。
-// 依次尝试候选地址直到收到响应。
 func (t *Socks5UDPTransport) ExchangeIKE(ctx context.Context, request []byte) ([]byte, error) {
 	if err := t.Connect(ctx); err != nil {
 		return nil, err
 	}
 
 	t.mu.Lock()
-	conn := t.conn
+	relay := t.relay
 	addrs := t.addresses
 	startIdx := t.addrIndex
 	t.mu.Unlock()
-	if conn == nil {
+	if relay == nil {
 		return nil, errors.New("socks5 relay not ready")
 	}
 
@@ -123,28 +167,24 @@ func (t *Socks5UDPTransport) ExchangeIKE(ctx context.Context, request []byte) ([
 				lastErr = err
 				continue
 			}
-			conn = t.conn
+			relay = t.relay
 			t.mu.Unlock()
 		}
 
-		// 发送 IKE 请求
-		fmt.Printf("socks5[ExchangeIKE] addr=%s req=%d bytes\n", addr, len(request))
-		if len(request) <= 576 {
-			fmt.Printf("  hex: %x\n", request)
-		}
-		if _, err := conn.Write(request); err != nil {
+		// 构造 SOCKS5 UDP 数据报并发送
+		dgram := socks5WrapUDPDatagram(addr, request)
+		if _, err := relay.Write(dgram); err != nil {
 			lastErr = fmt.Errorf("socks5 IKE 发送失败: %w", err)
 			continue
 		}
-		_ = conn.SetReadDeadline(time.Now().Add(t.timeout))
+		_ = relay.SetReadDeadline(time.Now().Add(t.timeout))
 
 		// 读取响应
 		buf := make([]byte, 65535)
-		n, err := conn.Read(buf)
+		n, err := relay.Read(buf)
 		if err != nil {
 			if i+1 < len(addrs) {
 				lastErr = fmt.Errorf("socks5 IKE 响应超时(%s): %w", addr, err)
-				// 关闭当前连接，下次尝试下一个地址
 				t.mu.Lock()
 				t.closeConn()
 				t.addrIndex = i + 1
@@ -154,14 +194,21 @@ func (t *Socks5UDPTransport) ExchangeIKE(ctx context.Context, request []byte) ([
 			}
 			continue
 		}
-		_ = conn.SetReadDeadline(time.Time{})
+		_ = relay.SetReadDeadline(time.Time{})
 
-		// 成功，记录当前地址
+		// 解析 SOCKS5 UDP 数据报
+		payload, _, ok := socks5ParseUDPDatagram(buf[:n])
+		if !ok {
+			lastErr = fmt.Errorf("socks5 IKE 响应格式错误: got %d bytes", n)
+			continue
+		}
+
+		// 成功
 		t.mu.Lock()
 		t.remoteAddr = addr
 		t.addrIndex = i
 		t.mu.Unlock()
-		return buf[:n], nil
+		return payload, nil
 	}
 	return nil, lastErr
 }
@@ -169,37 +216,43 @@ func (t *Socks5UDPTransport) ExchangeIKE(ctx context.Context, request []byte) ([
 // SendESPPacket 通过 SOCKS5 UDP Associate 中继一个 ESP 数据包。
 func (t *Socks5UDPTransport) SendESPPacket(ctx context.Context, data []byte) error {
 	t.mu.Lock()
-	conn := t.conn
+	relay := t.relay
+	addr := t.remoteAddr
 	t.mu.Unlock()
-	if conn == nil {
+	if relay == nil {
 		return errors.New("socks5 transport not connected")
 	}
-	_, err := conn.Write(data)
+	dgram := socks5WrapUDPDatagram(addr, data)
+	_, err := relay.Write(dgram)
 	return err
 }
 
 // ReadESPPacket 通过 SOCKS5 UDP Associate 中继读取一个 ESP 数据包。
 func (t *Socks5UDPTransport) ReadESPPacket(ctx context.Context) ([]byte, error) {
 	t.mu.Lock()
-	conn := t.conn
+	relay := t.relay
 	t.mu.Unlock()
-	if conn == nil {
+	if relay == nil {
 		return nil, errors.New("socks5 transport not connected")
 	}
 	if d, ok := ctx.Deadline(); ok {
-		_ = conn.SetReadDeadline(d)
+		_ = relay.SetReadDeadline(d)
 	} else {
-		_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		_ = relay.SetReadDeadline(time.Now().Add(30 * time.Second))
 	}
 	buf := make([]byte, 65535)
-	n, err := conn.Read(buf)
+	n, err := relay.Read(buf)
 	if err != nil {
 		return nil, err
 	}
-	return buf[:n], nil
+	payload, _, ok := socks5ParseUDPDatagram(buf[:n])
+	if !ok {
+		return nil, fmt.Errorf("socks5 ESP 响应格式错误: got %d bytes", n)
+	}
+	return payload, nil
 }
 
-// Close 关闭 SOCKS5 传输层（TCP 控制连接 + UDP 中继 socket）。
+// Close 关闭 SOCKS5 传输层。
 func (t *Socks5UDPTransport) Close(ctx context.Context) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -219,80 +272,158 @@ func (t *Socks5UDPTransport) RemoteAddr() string {
 }
 
 func (t *Socks5UDPTransport) closeConn() {
-		if t.conn != nil {
-			_ = t.conn.Close()
-			t.conn = nil
-		}
-		if t.client != nil {
-			_ = t.client.Close()
-			t.client = nil
+	if t.relay != nil {
+		_ = t.relay.Close()
+		t.relay = nil
+	}
+}
+
+// socks5 辅助函数
+
+func readFull(r net.Conn, b []byte) error {
+	n := 0
+	for n < len(b) {
+		nn, err := r.Read(b[n:])
+		n += nn
+		if err != nil {
+			return err
 		}
 	}
-	
-	// socks5WrapUDPDatagram 构造 SOCKS5 UDP 数据报（RSV + FRAG + ATYP + DST.ADDR + DST.PORT + DATA）。
-	func socks5WrapUDPDatagram(remoteAddr string, payload []byte) []byte {
-		host, portStr, _ := net.SplitHostPort(remoteAddr)
-		port := 500
-		if p, err := net.LookupPort("udp", portStr); err == nil {
-			port = p
+	return nil
+}
+
+func socks5SendUserPass(control net.Conn, username, password string) error {
+	req := []byte{0x01, byte(len(username))}
+	req = append(req, []byte(username)...)
+	req = append(req, byte(len(password)))
+	req = append(req, []byte(password)...)
+	if _, err := control.Write(req); err != nil {
+		return fmt.Errorf("socks5 密码认证发送失败: %w", err)
+	}
+	resp := make([]byte, 2)
+	if err := readFull(control, resp); err != nil {
+		return fmt.Errorf("socks5 密码认证响应失败: %w", err)
+	}
+	if resp[0] != 0x01 || resp[1] != 0x00 {
+		return fmt.Errorf("socks5 密码认证拒绝")
+	}
+	return nil
+}
+
+type socks5Reply struct {
+	IP   net.IP
+	Port int
+}
+
+func socks5ReadAssociateReply(control net.Conn) (*socks5Reply, error) {
+	header := make([]byte, 4)
+	if err := readFull(control, header); err != nil {
+		return nil, fmt.Errorf("socks5 UDP ASSOCIATE 回复头读取失败: %w", err)
+	}
+	if header[0] != 0x05 || header[1] != 0x00 {
+		return nil, fmt.Errorf("socks5 UDP ASSOCIATE 回复状态错误: ver=0x%02x rep=0x%02x", header[0], header[1])
+	}
+	var addr net.IP
+	switch header[3] {
+	case 0x01: // IPv4
+		b := make([]byte, 4)
+		if err := readFull(control, b); err != nil {
+			return nil, fmt.Errorf("socks5 UDP ASSOCIATE IPv4 地址读取失败: %w", err)
 		}
-		out := []byte{0x00, 0x00, 0x00} // RSV(2) + FRAG(1)
-		if ip := net.ParseIP(host); ip != nil {
-			if ip4 := ip.To4(); ip4 != nil {
-				out = append(out, 0x01) // IPv4
-				out = append(out, ip4...)
-			} else {
-				out = append(out, 0x04) // IPv6
-				out = append(out, ip.To16()...)
-			}
+		addr = net.IPv4(b[0], b[1], b[2], b[3])
+	case 0x03: // 域名
+		lenBuf := make([]byte, 1)
+		if err := readFull(control, lenBuf); err != nil {
+			return nil, err
+		}
+		host := make([]byte, lenBuf[0])
+		if err := readFull(control, host); err != nil {
+			return nil, err
+		}
+		addr = net.ParseIP(string(host))
+		if addr == nil {
+			addr = net.IPv4zero
+		}
+	case 0x04: // IPv6
+		b := make([]byte, 16)
+		if err := readFull(control, b); err != nil {
+			return nil, fmt.Errorf("socks5 UDP ASSOCIATE IPv6 地址读取失败: %w", err)
+		}
+		addr = net.IP(b)
+	default:
+		return nil, fmt.Errorf("socks5 UDP ASSOCIATE 未知地址类型: 0x%02x", header[3])
+	}
+	portBuf := make([]byte, 2)
+	if err := readFull(control, portBuf); err != nil {
+		return nil, fmt.Errorf("socks5 UDP ASSOCIATE 端口读取失败: %w", err)
+	}
+	return &socks5Reply{IP: addr, Port: int(binary.BigEndian.Uint16(portBuf))}, nil
+}
+
+// socks5WrapUDPDatagram 构造 SOCKS5 UDP 数据报（RSV + FRAG + ATYP + DST.ADDR + DST.PORT + DATA）。
+func socks5WrapUDPDatagram(remoteAddr string, payload []byte) []byte {
+	host, portStr, _ := net.SplitHostPort(remoteAddr)
+	port := 500
+	if p, err := strconv.Atoi(portStr); err == nil {
+		port = p
+	}
+	out := []byte{0x00, 0x00, 0x00} // RSV(2) + FRAG(1)
+	if ip := net.ParseIP(host); ip != nil {
+		if ip4 := ip.To4(); ip4 != nil {
+			out = append(out, 0x01) // IPv4
+			out = append(out, ip4...)
 		} else {
-			out = append(out, 0x03) // 域名
-			out = append(out, byte(len(host)))
-			out = append(out, host...)
+			out = append(out, 0x04) // IPv6
+			out = append(out, ip.To16()...)
 		}
-		out = binary.BigEndian.AppendUint16(out, uint16(port))
-		out = append(out, payload...)
-		return out
+	} else {
+		out = append(out, 0x03) // 域名
+		out = append(out, byte(len(host)))
+		out = append(out, host...)
 	}
-	
-	// socks5ParseUDPDatagram 解析 SOCKS5 UDP 数据报，返回 payload 和目标地址。
-	func socks5ParseUDPDatagram(data []byte) (payload []byte, dstAddr string, ok bool) {
-		if len(data) < 4 {
-			return nil, "", false
-		}
-		if data[0] != 0x00 || data[1] != 0x00 || data[2] != 0x00 {
-			return nil, "", false
-		}
-		pos := 4
-		var host string
-		switch data[3] {
-		case 0x01: // IPv4
-			if len(data) < pos+4+2 {
-				return nil, "", false
-			}
-			host = net.IP(data[pos : pos+4]).String()
-			pos += 4
-		case 0x03: // 域名
-			if len(data) < pos+1 {
-				return nil, "", false
-			}
-			hlen := int(data[pos])
-			pos++
-			if len(data) < pos+hlen+2 {
-				return nil, "", false
-			}
-			host = string(data[pos : pos+hlen])
-			pos += hlen
-		case 0x04: // IPv6
-			if len(data) < pos+16+2 {
-				return nil, "", false
-			}
-			host = net.IP(data[pos : pos+16]).String()
-			pos += 16
-		default:
-			return nil, "", false
-		}
-		port := int(binary.BigEndian.Uint16(data[pos:]))
-		pos += 2
-		return data[pos:], net.JoinHostPort(host, strconv.Itoa(port)), true
+	out = binary.BigEndian.AppendUint16(out, uint16(port))
+	out = append(out, payload...)
+	return out
+}
+
+// socks5ParseUDPDatagram 解析 SOCKS5 UDP 数据报，返回 payload 和目标地址。
+func socks5ParseUDPDatagram(data []byte) (payload []byte, dstAddr string, ok bool) {
+	if len(data) < 4 {
+		return nil, "", false
 	}
+	if data[0] != 0x00 || data[1] != 0x00 || data[2] != 0x00 {
+		return nil, "", false
+	}
+	pos := 4
+	var host string
+	switch data[3] {
+	case 0x01: // IPv4
+		if len(data) < pos+4+2 {
+			return nil, "", false
+		}
+		host = net.IP(data[pos : pos+4]).String()
+		pos += 4
+	case 0x03: // 域名
+		if len(data) < pos+1 {
+			return nil, "", false
+		}
+		hlen := int(data[pos])
+		pos++
+		if len(data) < pos+hlen+2 {
+			return nil, "", false
+		}
+		host = string(data[pos : pos+hlen])
+		pos += hlen
+	case 0x04: // IPv6
+		if len(data) < pos+16+2 {
+			return nil, "", false
+		}
+		host = net.IP(data[pos : pos+16]).String()
+		pos += 16
+	default:
+		return nil, "", false
+	}
+	port := int(binary.BigEndian.Uint16(data[pos:]))
+	pos += 2
+	return data[pos:], net.JoinHostPort(host, strconv.Itoa(port)), true
+}
