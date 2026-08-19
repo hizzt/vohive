@@ -115,9 +115,9 @@ func (t *Socks5UDPTransport) dialAddr(ctx context.Context, addr string) error {
 		return fmt.Errorf("socks5 认证方法不被代理接受: 0x%02x", resp[1])
 	}
 
-	// UDP ASSOCIATE
-	req := []byte{0x05, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
-	if _, err := control.Write(req); err != nil {
+// UDP ASSOCIATE（标准格式，DST=0.0.0.0:0，匹配旧二进制 txthinking 行为）
+		req := []byte{0x05, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+		if _, err := control.Write(req); err != nil {
 		return fmt.Errorf("socks5 UDP ASSOCIATE 发送失败: %w", err)
 	}
 	reply, err := socks5ReadAssociateReply(control)
@@ -131,9 +131,11 @@ func (t *Socks5UDPTransport) dialAddr(ctx context.Context, addr string) error {
 	}
 
 	// 创建 UDP socket 连接到中继端
-	udpConn, err := net.DialUDP("udp", nil, relayUDP)
+	// 使用不绑定的 UDP 监听（可接收任意来源的响应），再通过 WriteTo 发送到中继。
+	laddr, _ := net.ResolveUDPAddr("udp4", "0.0.0.0:0")
+	udpConn, err := net.ListenUDP("udp4", laddr)
 	if err != nil {
-		return fmt.Errorf("socks5 UDP 中继连接失败: %w", err)
+		return fmt.Errorf("socks5 UDP 中继监听失败: %w", err)
 	}
 	t.relay = udpConn
 	t.relayEP = relayUDP
@@ -176,7 +178,7 @@ func (t *Socks5UDPTransport) ExchangeIKE(ctx context.Context, request []byte) ([
 
 		// 构造 SOCKS5 UDP 数据报并发送
 		dgram := socks5WrapUDPDatagram(addr, request)
-		if _, err := relay.Write(dgram); err != nil {
+		if _, err := relay.WriteToUDP(dgram, t.relayEP); err != nil {
 			lastErr = fmt.Errorf("socks5 IKE 发送失败: %w", err)
 			continue
 		}
@@ -184,7 +186,7 @@ func (t *Socks5UDPTransport) ExchangeIKE(ctx context.Context, request []byte) ([
 
 		// 读取响应
 		buf := make([]byte, 65535)
-		n, err := relay.Read(buf)
+		n, _, err := relay.ReadFromUDP(buf)
 		if err != nil {
 			if i+1 < len(addrs) {
 				lastErr = fmt.Errorf("socks5 IKE 响应超时(%s): %w", addr, err)
@@ -226,7 +228,7 @@ func (t *Socks5UDPTransport) SendESPPacket(ctx context.Context, data []byte) err
 		return errors.New("socks5 transport not connected")
 	}
 	dgram := socks5WrapUDPDatagram(addr, data)
-	_, err := relay.Write(dgram)
+	_, err := relay.WriteToUDP(dgram, t.relayEP)
 	return err
 }
 
@@ -244,7 +246,7 @@ func (t *Socks5UDPTransport) ReadESPPacket(ctx context.Context) ([]byte, error) 
 		_ = relay.SetReadDeadline(time.Now().Add(30 * time.Second))
 	}
 	buf := make([]byte, 65535)
-	n, err := relay.Read(buf)
+	n, _, err := relay.ReadFromUDP(buf)
 	if err != nil {
 		return nil, err
 	}
