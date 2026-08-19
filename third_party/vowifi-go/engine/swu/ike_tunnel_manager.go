@@ -150,18 +150,24 @@ func (m *IKEPacketTunnelManager) EstablishTunnel(ctx context.Context, cfg Tunnel
 	if err != nil {
 		return nil, err
 	}
-	childSPI, err := m.childSPI(random)
-	if err != nil {
-		return nil, err
-	}
-	initRunner := m.Config.InitRunner
-	if initRunner == nil {
-		initRunner = ikev2.RunIKE_SA_INIT
-	}
-	init, err := initRunner(ctx, ikev2.InitConfig{
-		Transport:  transport,
-		Random:     random,
-		SA:         m.Config.SA,
+childSPI, err := m.childSPI(random)
+		if err != nil {
+			return nil, err
+		}
+		// 使用更完整的 SA 提议（而非仅 DefaultIKEProposal 的单个提议），
+		// 旧二进制在 swu/session.go 中通过配置文件设置了更多提议。
+		sa := m.Config.SA
+		if len(sa.Proposals) == 0 {
+			sa = comprehensiveIKEProposal()
+		}
+		initRunner := m.Config.InitRunner
+		if initRunner == nil {
+			initRunner = ikev2.RunIKE_SA_INIT
+		}
+		init, err := initRunner(ctx, ikev2.InitConfig{
+			Transport:  transport,
+			Random:     random,
+			SA:         sa,
 		LocalIP:    transportCfg.LocalIP,
 		LocalPort:  transportCfg.LocalPort,
 		RemoteIP:   transportCfg.RemoteIP,
@@ -692,4 +698,32 @@ func ikeKeysUsable(keys ikev2.IKEKeys) bool {
 		len(keys.SKEr) >= p.EncryptionKeyLength &&
 		len(keys.SKPi) >= p.PRFKeyLength &&
 		len(keys.SKPr) >= p.PRFKeyLength
+}
+
+// comprehensiveIKEProposal 返回包含多个提议的 IKE SA，匹配旧二进制 swu/session.go 的配置。
+// 旧二进制 IKE_SA_INIT 为 572 字节含 4 个提议，覆盖不同 DH 组和算法组合。
+// 单独的 DefaultIKEProposal（仅 Curve25519）被 ePDG 丢弃。
+func comprehensiveIKEProposal() ikev2.SecurityAssociation {
+	prop := func(num uint8, dhGroup uint16) ikev2.Proposal {
+		encr := ikev2.Transform{Type: ikev2.TransformENCR, ID: ikev2.ENCR_AES_CBC,
+			Attributes: []ikev2.TransformAttribute{ikev2.KeyLengthAttribute(128)}}
+		integ := ikev2.Transform{Type: ikev2.TransformINTEG, ID: ikev2.INTEG_HMAC_SHA2_256_128}
+		prf := ikev2.Transform{Type: ikev2.TransformPRF, ID: ikev2.PRF_HMAC_SHA2_256}
+		dh := ikev2.Transform{Type: ikev2.TransformDHRGroup, ID: dhGroup}
+		return ikev2.Proposal{Number: num, ProtocolID: ikev2.ProtocolIKE, Transforms: []ikev2.Transform{encr, prf, integ, dh}}
+	}
+	propAES256SHA1 := func(num uint8, dhGroup uint16) ikev2.Proposal {
+		encr := ikev2.Transform{Type: ikev2.TransformENCR, ID: ikev2.ENCR_AES_CBC,
+			Attributes: []ikev2.TransformAttribute{ikev2.KeyLengthAttribute(256)}}
+		integ := ikev2.Transform{Type: ikev2.TransformINTEG, ID: ikev2.INTEG_HMAC_SHA1_96}
+		prf := ikev2.Transform{Type: ikev2.TransformPRF, ID: ikev2.PRF_HMAC_SHA1}
+		dh := ikev2.Transform{Type: ikev2.TransformDHRGroup, ID: dhGroup}
+		return ikev2.Proposal{Number: num, ProtocolID: ikev2.ProtocolIKE, Transforms: []ikev2.Transform{encr, prf, integ, dh}}
+	}
+	return ikev2.SecurityAssociation{Proposals: []ikev2.Proposal{
+		prop(1, ikev2.DHGroupCurve25519),       // Proposal 1: AES-128+SHA256+Curve25519
+		prop(2, ikev2.DHGroup2048BitMODP),       // Proposal 2: AES-128+SHA256+MODP 2048
+		prop(3, ikev2.DHGroup256BitECP),         // Proposal 3: AES-128+SHA256+ECP 256
+		propAES256SHA1(4, ikev2.DHGroup2048BitMODP), // Proposal 4: AES-256+SHA1+MODP 2048
+	}}
 }
