@@ -292,6 +292,10 @@ func (m *IKEPacketTunnelManager) transportConfigs(cfg TunnelConfig, epdg string)
 	localPort := m.Config.LocalPort
 	localIP := normalizedMOBIKEIP(m.Config.LocalIP, cfg.OuterLocalIP)
 	remoteIP := normalizedMOBIKEIP(m.Config.RemoteIP, tunnelAddressHost(epdg))
+	// 若未配置本端 IP，选取默认路由接口的 IP（NAT 检测载荷需要 4 元组均有效才会生成）
+	if localIP == nil {
+		localIP = defaultLocalIP()
+	}
 // 当 ePDG 是域名时，在本地解析到 IP 再传递给传输层（SOCKS5 代理的 DNS 可能无法解析 3gppnetwork.org 域）
 	// 同时收集所有 A 记录，SOCKS5 传输层会依次尝试。
 	var remoteAddrs []string
@@ -726,4 +730,18 @@ func comprehensiveIKEProposal() ikev2.SecurityAssociation {
 		prop(3, ikev2.DHGroup256BitECP),         // Proposal 3: AES-128+SHA256+ECP 256
 		propAES256SHA1(4, ikev2.DHGroup2048BitMODP), // Proposal 4: AES-256+SHA1+MODP 2048
 	}}
+}
+
+// defaultLocalIP 返回默认路由接口的 IPv4 地址，用于 IKE 的 NAT 检测载荷。
+func defaultLocalIP() net.IP {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return nil
+	}
+	for _, a := range addrs {
+		if ipnet, ok := a.(*net.IPNet); ok && !ipnet.IP.IsLoopback() && ipnet.IP.To4() != nil {
+			return ipnet.IP.To4()
+		}
+	}
+	return nil
 }
