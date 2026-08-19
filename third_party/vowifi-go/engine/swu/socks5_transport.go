@@ -24,6 +24,7 @@ type Socks5UDPTransport struct {
 	timeout   time.Duration
 
 	mu       sync.Mutex
+	control  net.Conn // SOCKS5 TCP 控制连接，UDP Associate 期间必须保持打开
 	relay    *net.UDPConn
 	relayEP  *net.UDPAddr
 	closed   bool
@@ -86,7 +87,8 @@ func (t *Socks5UDPTransport) dialAddr(ctx context.Context, addr string) error {
 	} else {
 		_ = control.SetDeadline(time.Now().Add(t.timeout))
 	}
-	defer control.Close()
+	// 注意：SOCKS5 UDP Associate 要求 TCP 控制连接在整个 UDP 会话期间保持打开，
+	// 因此不能 defer control.Close()。关闭统一在 closeConn() 中处理。
 
 	// 版本协商
 	methods := []byte{0x00}
@@ -135,6 +137,7 @@ func (t *Socks5UDPTransport) dialAddr(ctx context.Context, addr string) error {
 	}
 	t.relay = udpConn
 	t.relayEP = relayUDP
+	t.control = control
 	t.remoteAddr = addr
 	return nil
 }
@@ -275,6 +278,10 @@ func (t *Socks5UDPTransport) closeConn() {
 	if t.relay != nil {
 		_ = t.relay.Close()
 		t.relay = nil
+	}
+	if t.control != nil {
+		_ = t.control.Close()
+		t.control = nil
 	}
 }
 
