@@ -37,6 +37,7 @@ type IKEESPTransportFactory func(TunnelConfig, ESPTransportConfig) (ESPPacketTra
 type IKETransportConfig struct {
 	EPDGAddress     string
 	RemoteAddr      string
+	RemoteAddrs     []string
 	LocalAddr       string
 	LocalIP         net.IP
 	RemoteIP        net.IP
@@ -49,6 +50,7 @@ type IKETransportConfig struct {
 type ESPTransportConfig struct {
 	EPDGAddress string
 	RemoteAddr  string
+	RemoteAddrs []string
 	LocalAddr   string
 	Timeout     time.Duration
 }
@@ -284,16 +286,28 @@ func (m *IKEPacketTunnelManager) transportConfigs(cfg TunnelConfig, epdg string)
 	localPort := m.Config.LocalPort
 	localIP := normalizedMOBIKEIP(m.Config.LocalIP, cfg.OuterLocalIP)
 	remoteIP := normalizedMOBIKEIP(m.Config.RemoteIP, tunnelAddressHost(epdg))
-	// 当 ePDG 是域名时，在本地解析到 IP 再传递给传输层（SOCKS5 代理的 DNS 可能无法解析 3gppnetwork.org 域）
+// 当 ePDG 是域名时，在本地解析到 IP 再传递给传输层（SOCKS5 代理的 DNS 可能无法解析 3gppnetwork.org 域）
+	// 同时收集所有 A 记录，SOCKS5 传输层会依次尝试。
+	var remoteAddrs []string
 	if net.ParseIP(tunnelAddressHost(epdg)) == nil {
-		if addrs, err := net.DefaultResolver.LookupIPAddr(context.Background(), tunnelAddressHost(epdg)); err == nil && len(addrs) > 0 {
-			if ip := addrs[0].IP; ip != nil {
-				epdg = ip.String()
-				remoteIP = normalizedMOBIKEIP(nil, epdg)
+		if ips, err := net.DefaultResolver.LookupIPAddr(context.Background(), tunnelAddressHost(epdg)); err == nil && len(ips) > 0 {
+			remoteAddrs = make([]string, 0, len(ips))
+			for _, ip := range ips {
+				if ip.IP != nil {
+					remoteAddrs = append(remoteAddrs, tunnelUDPAddr(ip.IP.String(), remotePort))
+				}
 			}
+			epdg = ips[0].IP.String()
+			remoteIP = normalizedMOBIKEIP(nil, epdg)
 		}
 	}
 	remoteAddr := tunnelUDPAddr(epdg, remotePort)
+	// 如果解析出了多个 IP 且 remoteAddr 不在列表中，补上
+	if remoteAddrs == nil {
+		remoteAddrs = []string{remoteAddr}
+	} else if len(remoteAddrs) > 0 && remoteAddrs[0] != remoteAddr {
+		remoteAddrs = append([]string{remoteAddr}, remoteAddrs...)
+	}
 	localAddr := ""
 	if local := firstPacketNonEmpty(cfg.OuterLocalIP); local != "" {
 		localAddr = tunnelUDPAddr(local, localPort)
@@ -306,23 +320,25 @@ func (m *IKEPacketTunnelManager) transportConfigs(cfg TunnelConfig, epdg string)
 	if !useMarker {
 		useMarker = remotePort == 4500
 	}
-	ikeCfg := IKETransportConfig{
-		EPDGAddress:     epdg,
-		RemoteAddr:      remoteAddr,
-		LocalAddr:       localAddr,
-		LocalIP:         localIP,
-		RemoteIP:        remoteIP,
-		LocalPort:       localPort,
-		RemotePort:      remotePort,
-		Timeout:         timeout,
-		UseNonESPMarker: useMarker,
-	}
-	espCfg := ESPTransportConfig{
-		EPDGAddress: epdg,
-		RemoteAddr:  remoteAddr,
-		LocalAddr:   localAddr,
-		Timeout:     timeout,
-	}
+ikeCfg := IKETransportConfig{
+			EPDGAddress:     epdg,
+			RemoteAddr:      remoteAddr,
+			RemoteAddrs:     remoteAddrs,
+			LocalAddr:       localAddr,
+			LocalIP:         localIP,
+			RemoteIP:        remoteIP,
+			LocalPort:       localPort,
+			RemotePort:      remotePort,
+			Timeout:         timeout,
+			UseNonESPMarker: useMarker,
+		}
+		espCfg := ESPTransportConfig{
+			EPDGAddress: epdg,
+			RemoteAddr:  remoteAddr,
+			RemoteAddrs: remoteAddrs,
+			LocalAddr:   localAddr,
+			Timeout:     timeout,
+		}
 	return ikeCfg, espCfg
 }
 
@@ -336,7 +352,7 @@ func (m *IKEPacketTunnelManager) ikeTransport(cfg TunnelConfig, transportCfg IKE
 	if m.socks5Transport != nil || socks5ProxyEnabled(cfg.Proxy) {
 		if m.socks5Transport == nil {
 			m.socks5Transport = NewSocks5UDPTransport(
-				*cfg.Proxy, transportCfg.RemoteAddr, transportCfg.LocalAddr, transportCfg.Timeout,
+				*cfg.Proxy, transportCfg.RemoteAddrs, transportCfg.LocalAddr, transportCfg.Timeout,
 			)
 		}
 		return m.socks5Transport, nil
@@ -359,7 +375,7 @@ func (m *IKEPacketTunnelManager) espTransport(cfg TunnelConfig, transportCfg ESP
 	if m.socks5Transport != nil || socks5ProxyEnabled(cfg.Proxy) {
 		if m.socks5Transport == nil {
 			m.socks5Transport = NewSocks5UDPTransport(
-				*cfg.Proxy, transportCfg.RemoteAddr, transportCfg.LocalAddr, transportCfg.Timeout,
+				*cfg.Proxy, transportCfg.RemoteAddrs, transportCfg.LocalAddr, transportCfg.Timeout,
 			)
 		}
 		return m.socks5Transport, nil

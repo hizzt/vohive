@@ -22,7 +22,7 @@ type Socks5UDPTransport struct {
 	proxyAddr  string
 	username   string
 	password   string
-	remoteAddr string // ePDG 地址 host:port
+	remoteAddr string // ePDG 地址 host:port（当前正在尝试的地址）
 	localAddr  string // 本端 UDP 地址（可选，用于绑定出端口）
 	timeout    time.Duration
 
@@ -31,6 +31,10 @@ type Socks5UDPTransport struct {
 	relay   *net.UDPConn
 	relayEP net.Addr // 代理分配的中继 UDP 端点
 	closed  bool
+
+	// 候选远程地址列表（ePDG 多 A 记录时依次尝试）
+	remoteAddrs []string
+	addrIndex   int
 }
 
 var _ ikev2.InitTransport = (*Socks5UDPTransport)(nil)
@@ -38,14 +42,19 @@ var _ ESPPacketReadWriteTransport = (*Socks5UDPTransport)(nil)
 var _ ESPPacketTransportCloser = (*Socks5UDPTransport)(nil)
 
 // NewSocks5UDPTransport 构造 SOCKS5 UDP Associate 传输层。
-// proxy 提供代理地址与可选的用户名/密码；remoteAddr 是目标 ePDG 地址（host:port）。
-func NewSocks5UDPTransport(proxy ProxyConfig, remoteAddr, localAddr string, timeout time.Duration) *Socks5UDPTransport {
+// proxy 提供代理地址与可选的用户名/密码；remoteAddrs 是目标 ePDG 地址列表（host:port），
+// 会依次尝试直到成功；localAddr 是可选的本端绑定地址。
+func NewSocks5UDPTransport(proxy ProxyConfig, remoteAddrs []string, localAddr string, timeout time.Duration) *Socks5UDPTransport {
+	if len(remoteAddrs) == 0 {
+		remoteAddrs = []string{""}
+	}
 	t := &Socks5UDPTransport{
-		proxyAddr:  strings.TrimSpace(proxy.Addr),
-		username:   proxy.Username,
-		password:   proxy.Password,
-		remoteAddr: strings.TrimSpace(remoteAddr),
-		localAddr:  strings.TrimSpace(localAddr),
+		proxyAddr:   strings.TrimSpace(proxy.Addr),
+		username:    proxy.Username,
+		password:    proxy.Password,
+		remoteAddrs: remoteAddrs,
+		remoteAddr:  remoteAddrs[0],
+		localAddr:   strings.TrimSpace(localAddr),
 	}
 	if timeout > 0 {
 		t.timeout = timeout
@@ -136,36 +145,44 @@ func (t *Socks5UDPTransport) Connect(ctx context.Context) error {
 }
 
 // ExchangeIKE 通过 SOCKS5 UDP Associate 中继一次 IKE 请求-响应。
+// 如果 ePDG 有多 A 记录，会依次尝试直到收到响应。
 func (t *Socks5UDPTransport) ExchangeIKE(ctx context.Context, request []byte) ([]byte, error) {
 	if err := t.Connect(ctx); err != nil {
 		return nil, err
 	}
 	t.mu.Lock()
 	relay, relayEP := t.relay, t.relayEP
+	addrs := t.remoteAddrs
 	t.mu.Unlock()
 	if relay == nil || relayEP == nil {
 		return nil, errors.New("socks5 relay not ready")
-}
-	
-	fmt.Printf("socks5[ExchangeIKE] remoteAddr=%s payload=%d bytes\n", t.remoteAddr, len(request))
-	dgram := socks5WrapUDPDatagram(t.remoteAddr, request)
-		if _, err := relay.WriteToUDP(dgram, relayEP.(*net.UDPAddr)); err != nil {
-			return nil, fmt.Errorf("socks5 IKE 发送失败: %w", err)
 	}
-	_ = relay.SetReadDeadline(time.Now().Add(t.timeout))
 
-	for {
+	var lastErr error
+	for _, addr := range addrs {
+		dgram := socks5WrapUDPDatagram(addr, request)
+		if _, err := relay.WriteToUDP(dgram, relayEP.(*net.UDPAddr)); err != nil {
+			lastErr = err
+			continue
+		}
+		_ = relay.SetReadDeadline(time.Now().Add(t.timeout))
 		buf := make([]byte, 65535)
 		n, _, err := relay.ReadFromUDP(buf)
 		if err != nil {
-			return nil, fmt.Errorf("socks5 IKE 响应超时: %w", err)
+			lastErr = fmt.Errorf("socks5 IKE 响应超时: %w", err)
+			continue
 		}
 		payload, _, ok := socks5ParseUDPDatagram(buf[:n])
 		if !ok {
 			continue
 		}
+		// 成功，记录当前地址供后续 ESP 使用
+		t.mu.Lock()
+		t.remoteAddr = addr
+		t.mu.Unlock()
 		return payload, nil
 	}
+	return nil, lastErr
 }
 
 // SendESPPacket 通过 SOCKS5 UDP Associate 中继一个 ESP 数据包。

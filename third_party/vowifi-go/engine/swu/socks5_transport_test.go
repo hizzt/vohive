@@ -182,7 +182,7 @@ func TestSocks5UDPTransport_ExchangeIKE(t *testing.T) {
 	}
 	defer srv.close()
 
-	transport := NewSocks5UDPTransport(ProxyConfig{Addr: srv.tcpAddr, Enabled: true}, srv.epdg, "", 5*time.Second)
+	transport := NewSocks5UDPTransport(ProxyConfig{Addr: srv.tcpAddr, Enabled: true}, []string{srv.epdg}, "", 5*time.Second)
 
 	resp, err := transport.ExchangeIKE(ctx, []byte("hello"))
 	if err != nil {
@@ -204,7 +204,7 @@ func TestSocks5UDPTransport_ESP(t *testing.T) {
 	}
 	defer srv.close()
 
-	transport := NewSocks5UDPTransport(ProxyConfig{Addr: srv.tcpAddr, Enabled: true}, srv.epdg, "", 5*time.Second)
+	transport := NewSocks5UDPTransport(ProxyConfig{Addr: srv.tcpAddr, Enabled: true}, []string{srv.epdg}, "", 5*time.Second)
 
 	if err := transport.SendESPPacket(ctx, []byte("ESP_DATA")); err != nil {
 		t.Fatalf("SendESPPacket: %v", err)
@@ -223,7 +223,7 @@ func TestSocks5UDPTransport_ProxyUnreachable(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	transport := NewSocks5UDPTransport(ProxyConfig{Addr: "127.0.0.1:1", Enabled: true}, "127.0.0.1:9999", "", 1*time.Second)
+	transport := NewSocks5UDPTransport(ProxyConfig{Addr: "127.0.0.1:1", Enabled: true}, []string{"127.0.0.1:9999"}, "", 1*time.Second)
 
 	_, err := transport.ExchangeIKE(ctx, []byte("test"))
 	if err == nil {
@@ -242,7 +242,7 @@ func TestSocks5UDPTransport_Close(t *testing.T) {
 	}
 	defer srv.close()
 
-	transport := NewSocks5UDPTransport(ProxyConfig{Addr: srv.tcpAddr, Enabled: true}, srv.epdg, "", 5*time.Second)
+	transport := NewSocks5UDPTransport(ProxyConfig{Addr: srv.tcpAddr, Enabled: true}, []string{srv.epdg}, "", 5*time.Second)
 	if err := transport.Connect(ctx); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
