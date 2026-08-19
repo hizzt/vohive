@@ -91,6 +91,11 @@ func (t *Socks5UDPTransport) dialAddr(ctx context.Context, addr string) error {
 	t.client = cl
 	t.conn = conn
 	t.remoteAddr = addr
+	// 关键：立即关闭 TCP 控制连接。旧二进制在 UDP ASSOCIATE 回复后立即 FIN。
+	// 代理（10.10.0.100:40010）要求 TCP 连接关闭后才激活 UDP 中继。
+	if cl.TCPConn != nil {
+		cl.TCPConn.Close()
+	}
 	return nil
 }
 
