@@ -277,13 +277,22 @@ func (m *IKEPacketTunnelManager) updateReauthenticationState(auth ikev2.FullAuth
 }
 
 func (m *IKEPacketTunnelManager) transportConfigs(cfg TunnelConfig, epdg string) (IKETransportConfig, ESPTransportConfig) {
-remotePort := m.Config.RemotePort
-		if remotePort == 0 {
-			remotePort = 500 // IKE 标准端口；NAT-T (4500) 在检测到 NAT 后切换
-		}
+	remotePort := m.Config.RemotePort
+	if remotePort == 0 {
+		remotePort = 500 // IKE 标准端口；NAT-T (4500) 在检测到 NAT 后切换
+	}
 	localPort := m.Config.LocalPort
 	localIP := normalizedMOBIKEIP(m.Config.LocalIP, cfg.OuterLocalIP)
 	remoteIP := normalizedMOBIKEIP(m.Config.RemoteIP, tunnelAddressHost(epdg))
+	// 当 ePDG 是域名时，在本地解析到 IP 再传递给传输层（SOCKS5 代理的 DNS 可能无法解析 3gppnetwork.org 域）
+	if net.ParseIP(tunnelAddressHost(epdg)) == nil {
+		if addrs, err := net.DefaultResolver.LookupIPAddr(context.Background(), tunnelAddressHost(epdg)); err == nil && len(addrs) > 0 {
+			if ip := addrs[0].IP; ip != nil {
+				epdg = ip.String()
+				remoteIP = normalizedMOBIKEIP(nil, epdg)
+			}
+		}
+	}
 	remoteAddr := tunnelUDPAddr(epdg, remotePort)
 	localAddr := ""
 	if local := firstPacketNonEmpty(cfg.OuterLocalIP); local != "" {
