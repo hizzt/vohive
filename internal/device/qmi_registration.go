@@ -92,6 +92,16 @@ func ensureQMIRegistration(ctx context.Context, deviceID string, cfg config.Devi
 		return fmt.Errorf("读取 QMI radio mode 失败: %w", err)
 	}
 	logger.Debug("QMI radio mode 初始检查", "device", deviceID, "mode", int(mode))
+
+	// 卡策略要求飞行模式（airplane=true，含 VoWiFi 直接强制）时，跳过整个 QMI 驻网协调。
+	// 否则开机模组恢复 Online 会让 modem 搜索并注册到本地基站（漫游风险），
+	// 而 VoWiFi 场景下设备最终本应保持飞行模式，由核心协调器统一切换。
+	if cfg.AirplaneEnabled {
+		logger.Info("QMI 驻网协调跳过：卡策略为飞行模式，保持当前 RF 状态",
+			"device", deviceID, "mode", int(mode), "airplane", cfg.AirplaneEnabled)
+		return nil
+	}
+
 	radioRestoredOnline := false
 	if isFlightOperatingMode(mode) {
 		logger.Info("QMI radio 初始处于飞行/低功耗，恢复 Online 后再驻网", "device", deviceID, "mode", int(mode))

@@ -651,6 +651,24 @@ func (f *fakeProvisioningSIM) EnsureSIMProvisioned(ctx context.Context, opts qmi
 	return qmimanager.UIMReadiness{UIMReady: true, Reason: qmimanager.UIMReadinessReady}, nil
 }
 
+func TestEnsureQMIRegistrationSkipsWhenAirplanePolicy(t *testing.T) {
+	ctrl := &qmiRegistrationTestController{
+		opMode: backend.ModeLowPower, // 初始飞行模式
+		servingSeq: []*backend.ServingSystem{
+			{RegStatus: 0, RegStatusText: "未注册"},
+		},
+	}
+	cfg := config.DeviceConfig{AirplaneEnabled: true} // 卡策略要求飞行
+	err := ensureQMIRegistration(context.Background(), "test", cfg, nil, ctrl,
+		qmiRegistrationOptions{PollInterval: time.Millisecond, MaxAttempts: 5})
+	if err != nil {
+		t.Fatalf("airplane=true 时应跳过（nil），得到: %v", err)
+	}
+	if len(ctrl.setModeCalls) > 0 {
+		t.Fatalf("airplane=true 时不应调用 SetOperatingMode，实际调用了 %d 次: %v", len(ctrl.setModeCalls), ctrl.setModeCalls)
+	}
+}
+
 func TestEnsureQMIRegistrationCallsProvisioningBeforeReady(t *testing.T) {
 	sim := &fakeProvisioningSIM{statuses: []qmi.SIMStatus{qmi.SIMNotReady, qmi.SIMReady}}
 	ctrl := &qmiRegistrationTestController{servingSeq: []*backend.ServingSystem{{RegStatus: 1, PSAttached: true}}}
