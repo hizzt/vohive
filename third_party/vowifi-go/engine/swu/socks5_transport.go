@@ -145,11 +145,12 @@ func (t *Socks5UDPTransport) ExchangeIKE(ctx context.Context, request []byte) ([
 	t.mu.Unlock()
 	if relay == nil || relayEP == nil {
 		return nil, errors.New("socks5 relay not ready")
-	}
-
+}
+	
+	fmt.Printf("socks5[ExchangeIKE] remoteAddr=%s payload=%d bytes\n", t.remoteAddr, len(request))
 	dgram := socks5WrapUDPDatagram(t.remoteAddr, request)
-	if _, err := relay.WriteToUDP(dgram, relayEP.(*net.UDPAddr)); err != nil {
-		return nil, fmt.Errorf("socks5 IKE 发送失败: %w", err)
+		if _, err := relay.WriteToUDP(dgram, relayEP.(*net.UDPAddr)); err != nil {
+			return nil, fmt.Errorf("socks5 IKE 发送失败: %w", err)
 	}
 	_ = relay.SetReadDeadline(time.Now().Add(t.timeout))
 
