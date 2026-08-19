@@ -206,6 +206,11 @@ func TestSocks5UDPTransport_ESP(t *testing.T) {
 
 	transport := NewSocks5UDPTransport(ProxyConfig{Addr: srv.tcpAddr, Enabled: true}, []string{srv.epdg}, "", 5*time.Second)
 
+	// 先通过 ExchangeIKE 建立连接（Connect 被自动调用）
+	if _, err := transport.ExchangeIKE(ctx, []byte("IKE_INIT")); err != nil {
+		t.Fatalf("ExchangeIKE: %v", err)
+	}
+
 	if err := transport.SendESPPacket(ctx, []byte("ESP_DATA")); err != nil {
 		t.Fatalf("SendESPPacket: %v", err)
 	}

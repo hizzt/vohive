@@ -78,13 +78,13 @@ func TestIKEPacketTunnelManagerEstablishesPacketSession(t *testing.T) {
 	if !result.MOBIKESupported || result.ChildSAIdentifier != "cafebabe/22222222" {
 		t.Fatalf("result MOBIKE/child id = %+v", result)
 	}
-	if gotIKETransport.RemoteAddr != "epdg.example:4500" || gotIKETransport.LocalAddr != "192.0.2.10:0" || !gotIKETransport.UseNonESPMarker {
-		t.Fatalf("IKE transport=%+v", gotIKETransport)
-	}
-	if gotESPTransport.RemoteAddr != "epdg.example:4500" || gotESPTransport.LocalAddr != "192.0.2.10:0" {
-		t.Fatalf("ESP transport=%+v", gotESPTransport)
-	}
-	if gotInit.Transport != ikeTransport || gotInit.RemotePort != 4500 {
+if gotIKETransport.RemoteAddr != "198.18.0.38:500" || gotIKETransport.LocalAddr != "192.0.2.10:0" || gotIKETransport.UseNonESPMarker {
+			t.Fatalf("IKE transport=%+v", gotIKETransport)
+		}
+		if gotESPTransport.RemoteAddr != "198.18.0.38:500" || gotESPTransport.LocalAddr != "192.0.2.10:0" {
+			t.Fatalf("ESP transport=%+v", gotESPTransport)
+		}
+		if gotInit.Transport != ikeTransport || gotInit.RemotePort != 500 {
 		t.Fatalf("init config=%+v", gotInit)
 	}
 	if gotAuth.Transport != ikeTransport || gotAuth.SIM == nil {
@@ -154,10 +154,10 @@ func TestIKEPacketTunnelManagerDerivesEPDGAndAKAIdentity(t *testing.T) {
 
 	wantEPDG := "epdg.epc.mnc028.mcc310.pub.3gppnetwork.org"
 	wantIdentity := "0310280233641503@nai.epc.mnc028.mcc310.3gppnetwork.org"
-	if gotIKETransport.EPDGAddress != wantEPDG || gotIKETransport.RemoteAddr != wantEPDG+":4500" {
-		t.Fatalf("IKE transport=%+v", gotIKETransport)
-	}
-	if gotAuth.EAPIdentity != wantIdentity || string(gotAuth.InitiatorID.Data) != wantIdentity {
+if gotIKETransport.EPDGAddress != "127.0.0.1" || gotIKETransport.RemoteAddr != "127.0.0.1:500" {
+			t.Fatalf("IKE transport=%+v", gotIKETransport)
+		}
+		if gotAuth.EAPIdentity != wantIdentity || string(gotAuth.InitiatorID.Data) != wantIdentity {
 		t.Fatalf("auth identity=%q initiator=%q", gotAuth.EAPIdentity, gotAuth.InitiatorID.Data)
 	}
 	if session.Result().EPDGAddress != wantEPDG {
