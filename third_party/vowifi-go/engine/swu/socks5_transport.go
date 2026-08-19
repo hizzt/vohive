@@ -128,6 +128,7 @@ func (t *Socks5UDPTransport) ExchangeIKE(ctx context.Context, request []byte) ([
 		}
 
 		// 发送 IKE 请求
+		fmt.Printf("socks5[ExchangeIKE] addr=%s req=%d bytes\n", addr, len(request))
 		if _, err := conn.Write(request); err != nil {
 			lastErr = fmt.Errorf("socks5 IKE 发送失败: %w", err)
 			continue
