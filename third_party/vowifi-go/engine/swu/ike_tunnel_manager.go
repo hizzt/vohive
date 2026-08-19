@@ -718,7 +718,8 @@ func comprehensiveIKEProposal() ikev2.SecurityAssociation {
 		integ := ikev2.Transform{Type: ikev2.TransformINTEG, ID: ikev2.INTEG_HMAC_SHA2_256_128}
 		prf := ikev2.Transform{Type: ikev2.TransformPRF, ID: ikev2.PRF_HMAC_SHA2_256}
 		dh := ikev2.Transform{Type: ikev2.TransformDHRGroup, ID: dhGroup}
-		return ikev2.Proposal{Number: num, ProtocolID: ikev2.ProtocolIKE, Transforms: []ikev2.Transform{encr, prf, integ, dh}}
+		// 顺序必须匹配旧二进制：ENCR → INTEG → PRF → DH
+		return ikev2.Proposal{Number: num, ProtocolID: ikev2.ProtocolIKE, Transforms: []ikev2.Transform{encr, integ, prf, dh}}
 	}
 	propAES256SHA1 := func(num uint8, dhGroup uint16) ikev2.Proposal {
 		encr := ikev2.Transform{Type: ikev2.TransformENCR, ID: ikev2.ENCR_AES_CBC,
@@ -726,7 +727,8 @@ func comprehensiveIKEProposal() ikev2.SecurityAssociation {
 		integ := ikev2.Transform{Type: ikev2.TransformINTEG, ID: ikev2.INTEG_HMAC_SHA1_96}
 		prf := ikev2.Transform{Type: ikev2.TransformPRF, ID: ikev2.PRF_HMAC_SHA1}
 		dh := ikev2.Transform{Type: ikev2.TransformDHRGroup, ID: dhGroup}
-		return ikev2.Proposal{Number: num, ProtocolID: ikev2.ProtocolIKE, Transforms: []ikev2.Transform{encr, prf, integ, dh}}
+		// 顺序：ENCR → INTEG → PRF → DH
+		return ikev2.Proposal{Number: num, ProtocolID: ikev2.ProtocolIKE, Transforms: []ikev2.Transform{encr, integ, prf, dh}}
 	}
 	return ikev2.SecurityAssociation{Proposals: []ikev2.Proposal{
 		prop(1, ikev2.DHGroup2048BitMODP),       // Proposal 1: AES-128+SHA256+MODP 2048 (匹配 KE)
