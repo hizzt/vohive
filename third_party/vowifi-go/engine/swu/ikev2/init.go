@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"strings"
 	"time"
@@ -84,18 +85,19 @@ func (t UDPTransport) ExchangeIKE(ctx context.Context, request []byte) ([]byte, 
 }
 
 type InitConfig struct {
-	Transport         InitTransport
-	Random            io.Reader
-	SA                SecurityAssociation
-	InitiatorSPI      uint64
-	NonceI            []byte
-	X25519PrivateKey  []byte
-	LocalIP           net.IP
-	LocalPort         uint16
-	RemoteIP          net.IP
-	RemotePort        uint16
-	KeyMaterialLength int
-}
+		Transport         InitTransport
+		Random            io.Reader
+		SA                SecurityAssociation
+		InitiatorSPI      uint64
+		NonceI            []byte
+		X25519PrivateKey  []byte
+		DHGroup           uint16 // 0=Curve25519, 14=MODP2048
+		LocalIP           net.IP
+		LocalPort         uint16
+		RemoteIP          net.IP
+		RemotePort        uint16
+		KeyMaterialLength int
+	}
 
 type InitResult struct {
 	RequestBytes    []byte
@@ -141,58 +143,82 @@ func RunIKE_SA_INIT(ctx context.Context, cfg InitConfig) (InitResult, error) {
 			return InitResult{}, err
 		}
 	}
-	priv, err := x25519PrivateKey(cfg.X25519PrivateKey, random)
-	if err != nil {
-		return InitResult{}, err
-	}
-	pubI := priv.PublicKey().Bytes()
-	sa := cfg.SA
-	if len(sa.Proposals) == 0 {
-		sa = DefaultIKEProposal()
-	}
-	saPayload, err := SecurityAssociationPayload(sa)
-	if err != nil {
-		return InitResult{}, err
-	}
-	payloads := []Payload{
-		saPayload,
-		KeyExchangePayload(DHGroupCurve25519, pubI),
-		NoncePayload(nonceI),
-	}
-	payloads = append(payloads, initNATPayloads(cfg, spiI, 0)...)
-	payloads = append(payloads, MOBIKESupportedNotify())
-	req := Message{
-		Header: Header{
-			InitiatorSPI: spiI,
-			ExchangeType: ExchangeIKE_SA_INIT,
-			Flags:        FlagInitiator,
-		},
-		Payloads: payloads,
-	}
-	reqBytes, err := req.MarshalBinary()
-	if err != nil {
-		return InitResult{}, err
-	}
-	respBytes, err := cfg.Transport.ExchangeIKE(ctx, reqBytes)
-	if err != nil {
-		return InitResult{}, err
-	}
-	resp, err := ParseMessage(respBytes)
-	if err != nil {
-		return InitResult{}, err
-	}
-	parsed, err := parseInitResponse(resp, spiI)
-	if err != nil {
-		return InitResult{}, err
-	}
-	respPub, err := ecdh.X25519().NewPublicKey(parsed.keyExchange.KeyData)
-	if err != nil {
-		return InitResult{}, fmt.Errorf("%w: responder KE: %w", ErrInvalidInitResponse, err)
-	}
-	shared, err := priv.ECDH(respPub)
-	if err != nil {
-		return InitResult{}, fmt.Errorf("%w: ECDH: %w", ErrInvalidInitResponse, err)
-	}
+priv, err := x25519PrivateKey(cfg.X25519PrivateKey, random)
+		if err != nil {
+			return InitResult{}, err
+		}
+		pubI := priv.PublicKey().Bytes()
+		dhGroup := cfg.DHGroup
+		if dhGroup == 0 {
+			dhGroup = DHGroupCurve25519
+		}
+		sa := cfg.SA
+		if len(sa.Proposals) == 0 {
+			sa = DefaultIKEProposal()
+		}
+		saPayload, err := SecurityAssociationPayload(sa)
+		if err != nil {
+			return InitResult{}, err
+		}
+		var kePayload Payload
+		var privKey *big.Int
+		switch dhGroup {
+		case DHGroup2048BitMODP:
+			pubB, privB, err := generateMODP2048Keypair(random)
+			if err != nil {
+				return InitResult{}, err
+			}
+			kePayload = KeyExchangePayload(DHGroup2048BitMODP, pubB)
+			pubI = pubB
+			privKey = privB
+		default:
+			kePayload = KeyExchangePayload(DHGroupCurve25519, pubI)
+		}
+		payloads := []Payload{
+			saPayload,
+			kePayload,
+			NoncePayload(nonceI),
+		}
+		payloads = append(payloads, initNATPayloads(cfg, spiI, 0)...)
+		payloads = append(payloads, MOBIKESupportedNotify())
+		req := Message{
+			Header: Header{
+				InitiatorSPI: spiI,
+				ExchangeType: ExchangeIKE_SA_INIT,
+				Flags:        FlagInitiator,
+			},
+			Payloads: payloads,
+		}
+		reqBytes, err := req.MarshalBinary()
+		if err != nil {
+			return InitResult{}, err
+		}
+		respBytes, err := cfg.Transport.ExchangeIKE(ctx, reqBytes)
+		if err != nil {
+			return InitResult{}, err
+		}
+		resp, err := ParseMessage(respBytes)
+		if err != nil {
+			return InitResult{}, err
+		}
+		parsed, err := parseInitResponse(resp, spiI)
+		if err != nil {
+			return InitResult{}, err
+		}
+		var shared []byte
+		switch dhGroup {
+		case DHGroup2048BitMODP:
+			shared = modp2048SharedSecret(privKey, parsed.keyExchange.KeyData)
+		default:
+			respPub, err := ecdh.X25519().NewPublicKey(parsed.keyExchange.KeyData)
+			if err != nil {
+				return InitResult{}, fmt.Errorf("%w: responder KE: %w", ErrInvalidInitResponse, err)
+			}
+			shared, err = priv.ECDH(respPub)
+			if err != nil {
+				return InitResult{}, fmt.Errorf("%w: ECDH: %w", ErrInvalidInitResponse, err)
+			}
+		}
 	profile, err := KeyMaterialProfileFromSA(parsed.sa)
 	if err != nil {
 		return InitResult{}, err
@@ -267,15 +293,15 @@ func parseInitResponse(resp Message, spiI uint64) (parsedInitResponse, error) {
 				return parsedInitResponse{}, err
 			}
 			out.sa = sa
-		case PayloadKE:
-			ke, err := ParseKeyExchange(p.Body)
-			if err != nil {
-				return parsedInitResponse{}, err
-			}
-			if ke.DHGroup != DHGroupCurve25519 {
-				return parsedInitResponse{}, fmt.Errorf("%w: unsupported DH group %d", ErrInvalidInitResponse, ke.DHGroup)
-			}
-			out.keyExchange = ke
+case PayloadKE:
+				ke, err := ParseKeyExchange(p.Body)
+				if err != nil {
+					return parsedInitResponse{}, err
+				}
+				if ke.DHGroup != DHGroupCurve25519 && ke.DHGroup != DHGroup2048BitMODP {
+					return parsedInitResponse{}, fmt.Errorf("%w: unsupported DH group %d", ErrInvalidInitResponse, ke.DHGroup)
+				}
+				out.keyExchange = ke
 		case PayloadNonce:
 			out.nonceR = append([]byte(nil), p.Body...)
 		case PayloadNotify:
@@ -358,6 +384,57 @@ func x25519PrivateKey(raw []byte, random io.Reader) (*ecdh.PrivateKey, error) {
 		return ecdh.X25519().NewPrivateKey(append([]byte(nil), raw...))
 	}
 	return ecdh.X25519().GenerateKey(random)
+}
+
+// RFC 3526 Group 14 (2048-bit MODP): p = 2^2048 - 2^1984 - 1 + 2^64 * { [2^1918 pi] + 124476 }
+var modp2048Prime *big.Int
+
+func init() {
+	modp2048Prime, _ = new(big.Int).SetString(
+		"FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1"+
+			"29024E088A67CC74020BBEA63B139B22514A08798E3404DD"+
+			"EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245"+
+			"E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED"+
+			"EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3D"+
+			"C2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F"+
+			"83655D23DCA3AD961C62F356208552BB9ED529077096966D"+
+			"670C354E4ABC9804F1746C08CA18217C32905E462E36CE3B"+
+			"E39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9"+
+			"DE2BCBF6955817183995497CEA956AE515D2261898FA0510"+
+			"15728E5A8AACAA68FFFFFFFFFFFFFFFF", 16)
+}
+
+func generateMODP2048Keypair(random io.Reader) (pub []byte, priv *big.Int, err error) {
+	if random == nil {
+		random = rand.Reader
+	}
+	// 私钥: 256 位随机数
+	privBytes := make([]byte, 32)
+	if _, err := io.ReadFull(random, privBytes); err != nil {
+		return nil, nil, err
+	}
+	priv = new(big.Int).SetBytes(privBytes)
+	priv.Mod(priv, modp2048Prime)
+	if priv.Sign() == 0 {
+		priv.SetInt64(1)
+	}
+	// 公钥: g^a mod p, g=2
+	two := big.NewInt(2)
+	pubBig := new(big.Int).Exp(two, priv, modp2048Prime)
+	pubBytes := make([]byte, 256) // 2048 bits = 256 bytes
+	pubFill := pubBig.Bytes()
+	copy(pubBytes[256-len(pubFill):], pubFill)
+	return pubBytes, priv, nil
+}
+
+func modp2048SharedSecret(priv *big.Int, peerPub []byte) []byte {
+	peer := new(big.Int).SetBytes(peerPub)
+	secret := new(big.Int).Exp(peer, priv, modp2048Prime)
+	// 返回 256 字节（2048 位）
+	secretBytes := make([]byte, 256)
+	secretFill := secret.Bytes()
+	copy(secretBytes[256-len(secretFill):], secretFill)
+	return secretBytes
 }
 
 func randomSPI(random io.Reader) (uint64, error) {

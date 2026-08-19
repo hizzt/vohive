@@ -164,15 +164,16 @@ childSPI, err := m.childSPI(random)
 		if initRunner == nil {
 			initRunner = ikev2.RunIKE_SA_INIT
 		}
-		init, err := initRunner(ctx, ikev2.InitConfig{
+init, err := initRunner(ctx, ikev2.InitConfig{
 			Transport:  transport,
 			Random:     random,
 			SA:         sa,
-		LocalIP:    transportCfg.LocalIP,
-		LocalPort:  transportCfg.LocalPort,
-		RemoteIP:   transportCfg.RemoteIP,
-		RemotePort: transportCfg.RemotePort,
-	})
+			DHGroup:    ikev2.DHGroup2048BitMODP,
+			LocalIP:    transportCfg.LocalIP,
+			LocalPort:  transportCfg.LocalPort,
+			RemoteIP:   transportCfg.RemoteIP,
+			RemotePort: transportCfg.RemotePort,
+		})
 	if err != nil {
 		return nil, err
 	}
@@ -725,9 +726,9 @@ func comprehensiveIKEProposal() ikev2.SecurityAssociation {
 		return ikev2.Proposal{Number: num, ProtocolID: ikev2.ProtocolIKE, Transforms: []ikev2.Transform{encr, prf, integ, dh}}
 	}
 	return ikev2.SecurityAssociation{Proposals: []ikev2.Proposal{
-		prop(1, ikev2.DHGroupCurve25519),       // Proposal 1: AES-128+SHA256+Curve25519
-		prop(2, ikev2.DHGroup2048BitMODP),       // Proposal 2: AES-128+SHA256+MODP 2048
-		prop(3, ikev2.DHGroup256BitECP),         // Proposal 3: AES-128+SHA256+ECP 256
+		prop(1, ikev2.DHGroup2048BitMODP),       // Proposal 1: AES-128+SHA256+MODP 2048 (匹配 KE)
+		prop(2, ikev2.DHGroupCurve25519),         // Proposal 2: AES-128+SHA256+Curve25519
+		prop(3, ikev2.DHGroup256BitECP),          // Proposal 3: AES-128+SHA256+ECP 256
 		propAES256SHA1(4, ikev2.DHGroup2048BitMODP), // Proposal 4: AES-256+SHA1+MODP 2048
 	}}
 }
