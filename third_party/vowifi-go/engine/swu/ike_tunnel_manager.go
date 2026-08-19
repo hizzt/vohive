@@ -277,10 +277,10 @@ func (m *IKEPacketTunnelManager) updateReauthenticationState(auth ikev2.FullAuth
 }
 
 func (m *IKEPacketTunnelManager) transportConfigs(cfg TunnelConfig, epdg string) (IKETransportConfig, ESPTransportConfig) {
-	remotePort := m.Config.RemotePort
-	if remotePort == 0 {
-		remotePort = 4500
-	}
+remotePort := m.Config.RemotePort
+		if remotePort == 0 {
+			remotePort = 500 // IKE 标准端口；NAT-T (4500) 在检测到 NAT 后切换
+		}
 	localPort := m.Config.LocalPort
 	localIP := normalizedMOBIKEIP(m.Config.LocalIP, cfg.OuterLocalIP)
 	remoteIP := normalizedMOBIKEIP(m.Config.RemoteIP, tunnelAddressHost(epdg))
