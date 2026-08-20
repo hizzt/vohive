@@ -15,6 +15,7 @@ const (
 )
 
 const (
+	NotifyInvalidKEPayload          uint16 = 17
 	NotifyUnacceptableAddresses     uint16 = 40
 	NotifyUnexpectedNATDetected     uint16 = 41
 	NotifyNATDetectionSourceIP      uint16 = 16388

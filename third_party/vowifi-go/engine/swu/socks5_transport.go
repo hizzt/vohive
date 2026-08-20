@@ -34,6 +34,7 @@ type Socks5UDPTransport struct {
 	remoteAddr string       // 当前活跃的 ePDG 地址
 	addresses  []string     // 候选 ePDG 地址列表
 	addrIndex  int
+	useNATT    bool         // NAT 检测后切换到 4500 端口并加 NAT-T marker
 }
 
 var _ ikev2.InitTransport = (*Socks5UDPTransport)(nil)
@@ -155,8 +156,13 @@ func (t *Socks5UDPTransport) ExchangeIKE(ctx context.Context, request []byte) ([
 			t.mu.Unlock()
 		}
 
-		// 手动封装 SOCKS5 UDP 数据报
-		dgram := socks5WrapUDPDatagram(addr, request)
+// 如果 NAT 检测到需要 NAT-T，IKE 报文前加 4 字节 0x00 marker
+			ikeData := request
+			if t.useNATT {
+				ikeData = append([]byte{0, 0, 0, 0}, request...)
+			}
+			// 手动封装 SOCKS5 UDP 数据报
+			dgram := socks5WrapUDPDatagram(addr, ikeData)
 		if _, err := udpConn.WriteToUDP(dgram, relayEP); err != nil {
 			lastErr = fmt.Errorf("socks5 IKE 发送失败: %w", err)
 			continue
@@ -187,6 +193,11 @@ func (t *Socks5UDPTransport) ExchangeIKE(ctx context.Context, request []byte) ([
 			continue
 		}
 		_ = dstAddr
+
+		// NAT-T 模式下响应报文也带 4 字节 0x00 marker，剥离后返回 IKE 报文
+		if t.useNATT && len(payload) >= 4 && payload[0] == 0 && payload[1] == 0 && payload[2] == 0 && payload[3] == 0 {
+			payload = payload[4:]
+		}
 
 		// 成功
 		t.mu.Lock()
@@ -255,6 +266,27 @@ func (t *Socks5UDPTransport) RemoteAddr() string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.remoteAddr
+}
+
+// SwitchToNATT 在 NAT 检测后将远程端口切换为 4500（NAT-T），并启用 NAT-T marker。
+// 需要重新建立 UDP Associate 连接。
+func (t *Socks5UDPTransport) SwitchToNATT() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.useNATT {
+		return
+	}
+	t.useNATT = true
+	// 将所有地址端口改为 4500
+	for i, a := range t.addresses {
+		if host, _, err := net.SplitHostPort(a); err == nil {
+			t.addresses[i] = net.JoinHostPort(host, "4500")
+		}
+	}
+	// 更新当前地址并重置连接
+	t.remoteAddr = ""
+	t.addrIndex = 0
+	t.closeConn()
 }
 
 func (t *Socks5UDPTransport) closeConn() {

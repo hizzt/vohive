@@ -421,3 +421,83 @@ func (ikeTunnelAKAProvider) CalculateAKA(rand16, autn16 []byte) (sim.AKAResult, 
 		IK:  bytes.Repeat([]byte{0x20}, 16),
 	}, nil
 }
+
+func TestRunIKEInitWithDHFallbackDegradesOnInvalidKEPayload(t *testing.T) {
+	var sawGroups []uint16
+
+	manager := NewIKEPacketTunnelManager(IKEPacketTunnelManagerConfig{})
+	transport := ikeTunnelNoopTransport{}
+	cfg := IKETransportConfig{
+		LocalIP:    net.ParseIP("192.0.2.10"),
+		LocalPort:  500,
+		RemoteIP:   net.ParseIP("198.51.100.1"),
+		RemotePort: 500,
+	}
+	random := bytes.NewReader(bytes.Repeat([]byte{0x55}, 64))
+
+	runner := func(ctx context.Context, ikeCfg ikev2.InitConfig) (ikev2.InitResult, error) {
+		sawGroups = append(sawGroups, ikeCfg.DHGroup)
+		if len(sawGroups) == 1 || ikeCfg.DHGroup == ikev2.DHGroup2048BitMODP {
+			return ikev2.InitResult{}, ikev2.ErrInvalidKEPayload
+		}
+		return ikev2.InitResult{
+			InitiatorSPI: 0x1122334455667788,
+			NonceI:       []byte{0xab, 0xcd},
+		}, nil
+	}
+
+	result, err := manager.runIKEInitWithDHFallback(context.Background(), runner, transport, cfg, random, comprehensiveIKEProposal())
+	if err != nil {
+		t.Fatalf("runIKEInitWithDHFallback() err=%v", err)
+	}
+	if len(sawGroups) != 2 {
+		t.Fatalf("initRunner calls=%d, want 2 (MODP2048 then MODP1024)", len(sawGroups))
+	}
+	if sawGroups[0] != ikev2.DHGroup2048BitMODP || sawGroups[1] != ikev2.DHGroup1024BitMODP {
+		t.Fatalf("DH groups=%v, want [14 2]", sawGroups)
+	}
+	if result.NonceI == nil || result.NonceI[0] != 0xab {
+		t.Fatalf("result from fallback attempt lost: %+v", result)
+	}
+}
+
+func TestRunIKEInitWithDHFallbackReturnsOtherErrors(t *testing.T) {
+	manager := NewIKEPacketTunnelManager(IKEPacketTunnelManagerConfig{})
+	transport := ikeTunnelNoopTransport{}
+	cfg := IKETransportConfig{
+		LocalIP:   net.ParseIP("192.0.2.10"),
+		LocalPort: 500,
+	}
+	random := bytes.NewReader(bytes.Repeat([]byte{0x55}, 64))
+
+	sentinel := errors.New("boom")
+	calls := 0
+	runner := func(ctx context.Context, ikeCfg ikev2.InitConfig) (ikev2.InitResult, error) {
+		calls++
+		return ikev2.InitResult{}, sentinel
+	}
+
+	_, err := manager.runIKEInitWithDHFallback(context.Background(), runner, transport, cfg, random, comprehensiveIKEProposal())
+	if err == nil || err.Error() != "boom" {
+		t.Fatalf("err=%v, want sentinel propagated", err)
+	}
+	if calls != 1 {
+		t.Fatalf("initRunner calls=%d, want 1 (non-KE error aborts fallback)", calls)
+	}
+}
+
+func TestFilterProposalsByDHGroup(t *testing.T) {
+	sa := comprehensiveIKEProposal() // 4 proposals: MODP2048 x1, MODP1024 x3
+	if len(sa.Proposals) != 4 {
+		t.Fatalf("comprehensive proposal count=%d, want 4", len(sa.Proposals))
+	}
+
+	g14 := filterProposalsByDHGroup(sa, ikev2.DHGroup2048BitMODP)
+	if len(g14.Proposals) != 1 {
+		t.Fatalf("MODP2048 filtered count=%d, want 1", len(g14.Proposals))
+	}
+	g2 := filterProposalsByDHGroup(sa, ikev2.DHGroup1024BitMODP)
+	if len(g2.Proposals) != 3 {
+		t.Fatalf("MODP1024 filtered count=%d, want 3", len(g2.Proposals))
+	}
+}

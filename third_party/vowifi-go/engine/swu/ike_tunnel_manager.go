@@ -6,10 +6,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
-	"net"
-	"strconv"
-	"strings"
+"io"
+		"net"
+		"os"
+		"strconv"
+		"strings"
 	"sync"
 	"time"
 
@@ -151,31 +152,38 @@ func (m *IKEPacketTunnelManager) EstablishTunnel(ctx context.Context, cfg Tunnel
 		return nil, err
 	}
 childSPI, err := m.childSPI(random)
-		if err != nil {
-			return nil, err
-		}
-		// 使用更完整的 SA 提议（而非仅 DefaultIKEProposal 的单个提议），
-		// 旧二进制在 swu/session.go 中通过配置文件设置了更多提议。
-		sa := m.Config.SA
-		if len(sa.Proposals) == 0 {
-			sa = comprehensiveIKEProposal()
-		}
-		initRunner := m.Config.InitRunner
-		if initRunner == nil {
-			initRunner = ikev2.RunIKE_SA_INIT
-		}
-init, err := initRunner(ctx, ikev2.InitConfig{
-			Transport:  transport,
-			Random:     random,
-			SA:         sa,
-			DHGroup:    ikev2.DHGroup1024BitMODP,
-			LocalIP:    transportCfg.LocalIP,
-			LocalPort:  transportCfg.LocalPort,
-			RemoteIP:   transportCfg.RemoteIP,
-			RemotePort: transportCfg.RemotePort,
-		})
 	if err != nil {
 		return nil, err
+	}
+	// 使用更完整的 SA 提议（而非仅 DefaultIKEProposal 的单个提议），
+	// 旧二进制在 swu/session.go 中通过配置文件设置了更多提议。
+	sa := m.Config.SA
+	if len(sa.Proposals) == 0 {
+		sa = comprehensiveIKEProposal()
+	}
+	initRunner := m.Config.InitRunner
+	if initRunner == nil {
+		initRunner = ikev2.RunIKE_SA_INIT
+	}
+	// https://github.com/autisticryptic/SimMaster 的 live.rs 观察到：
+	// ePDG 可能拒绝 MODP 2048 KE（INVALID_KE_PAYLOAD），要求降级到 MODP 1024。
+	// 每次尝试都使用全新的 SPI、nonce、DH 密钥对，匹配旧二进制重试行为。
+	init, err := m.runIKEInitWithDHFallback(ctx, initRunner, transport, transportCfg, random, sa)
+	if err != nil {
+		return nil, err
+	}
+	// NAT 检测后切换到 4500 端口（NAT-T），IKE 报文需带 4 字节 0x00 marker。
+	// 注意：此功能尚在调试中，临时禁用回归 500 端口验证基本 IKE_AUTH 可通。
+	// v1.5.5 和 SimMaster 在 IKE_SA_INIT 检测到 NAT 后均将后续 IKE_AUTH 发送至 4500。
+	if init.NATDetected {
+		_ = init.NATDetected
+		_ = transport
+		// if natt, ok := transport.(interface{ SwitchToNATT() }); ok {
+		// 	fmt.Fprintf(os.Stderr, "[swu] NAT detected, switching to 4500\n")
+		// 	natt.SwitchToNATT()
+		// } else {
+		// 	fmt.Fprintf(os.Stderr, "[swu] NAT detected but transport does not support SwitchToNATT\n")
+		// }
 	}
 	authRunner := m.Config.AuthRunner
 	if authRunner == nil {
@@ -244,6 +252,92 @@ init, err := initRunner(ctx, ikev2.InitConfig{
 		return nil, fmt.Errorf("%w: packet session factory returned nil", ErrInvalidIKETunnelManager)
 	}
 	return session, nil
+}
+
+// runIKEInitWithDHFallback 优先尝试 MODP 2048，若 ePDG 拒绝该 KE group
+//（INVALID_KE_PAYLOAD），则降级到 MODP 1024 重试，每次使用全新 SPI/nonce/DH。
+// 参考 SimMaster 的 run_live_ike_until_depth（live.rs）行为：
+// 每次尝试都是完全独立的 IKE_SA_INIT 会话（新 SPI、新 nonce、新 DH 密钥对）。
+func (m *IKEPacketTunnelManager) runIKEInitWithDHFallback(
+	ctx context.Context,
+	initRunner IKEInitRunner,
+	transport ikev2.InitTransport,
+	transportCfg IKETransportConfig,
+	random io.Reader,
+	sa ikev2.SecurityAssociation,
+) (ikev2.InitResult, error) {
+	type dhAttempt struct {
+		group uint16
+		name  string
+	}
+	attempts := []dhAttempt{
+		{ikev2.DHGroup2048BitMODP, "MODP 2048"},
+		{ikev2.DHGroup1024BitMODP, "MODP 1024"},
+	}
+
+	var lastErr error
+	for _, a := range attempts {
+		filtered := filterProposalsByDHGroup(sa, a.group)
+		if len(filtered.Proposals) == 0 {
+			lastErr = fmt.Errorf("no proposals match DH group %d", a.group)
+			continue
+		}
+result, err := initRunner(ctx, ikev2.InitConfig{
+				Transport:  transport,
+				Random:     random,
+				SA:         filtered,
+				DHGroup:    a.group,
+				LocalIP:    transportCfg.LocalIP,
+				LocalPort:  transportCfg.LocalPort,
+				RemoteIP:   transportCfg.RemoteIP,
+				RemotePort: transportCfg.RemotePort,
+			})
+			if err == nil {
+				fmt.Fprintf(os.Stderr, "[swu] IKE_SA_INIT succeeded with DH group %s\n", a.name)
+				return result, nil
+			}
+			lastErr = err
+			if isIKEInitRetryableError(err) {
+				fmt.Fprintf(os.Stderr, "[swu] IKE_SA_INIT DH group %s failed (%v), retrying next group\n", a.name, err)
+				continue
+			}
+		// 非可重试错误，直接返回
+		return ikev2.InitResult{}, err
+	}
+	return ikev2.InitResult{}, lastErr
+}
+
+// isIKEInitRetryableError 判断 IKE_SA_INIT 错误是否应降级重试。
+// ePDG 可能拒绝 KE group（INVALID_KE_PAYLOAD）或直接超时，都应换 group 尝试。
+func isIKEInitRetryableError(err error) bool {
+	if errors.Is(err, ikev2.ErrInvalidKEPayload) {
+		return true
+	}
+	// 网络层超时也视为可降级重试：ePDG 可能丢弃不支持的 KE 而不回包
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	return false
+}
+
+// filterProposalsByDHGroup 从 SA 中过滤出匹配指定 DH group 的提议。
+// 每个 proposal 的 Transforms 中必须包含 TransformDHRGroup 且 ID 匹配 dhGroup。
+func filterProposalsByDHGroup(sa ikev2.SecurityAssociation, dhGroup uint16) ikev2.SecurityAssociation {
+	var filtered []ikev2.Proposal
+	for _, p := range sa.Proposals {
+		matched := false
+		for _, t := range p.Transforms {
+			if t.Type == ikev2.TransformDHRGroup && t.ID == dhGroup {
+				matched = true
+				break
+			}
+		}
+		if matched {
+			filtered = append(filtered, p)
+		}
+	}
+	return ikev2.SecurityAssociation{Proposals: filtered}
 }
 
 func (m *IKEPacketTunnelManager) updateReauthenticationState(auth ikev2.FullAuthResult) {

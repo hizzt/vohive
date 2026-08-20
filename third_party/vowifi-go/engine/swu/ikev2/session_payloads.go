@@ -31,6 +31,8 @@ const (
 	ConfigInternalIPv4Subnet    uint16 = 13
 	ConfigSupportedAttributes   uint16 = 14
 	ConfigInternalIPv6Subnet    uint16 = 15
+	ConfigInternalIPv4Pcscf     uint16 = 20
+	ConfigInternalIPv6Pcscf     uint16 = 21
 )
 
 const (

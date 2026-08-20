@@ -81,16 +81,37 @@ func DefaultIKEProposal() SecurityAssociation {
 }
 
 func DefaultESPProposal(spi []byte) SecurityAssociation {
+	spiCopy := append([]byte(nil), spi...)
 	return SecurityAssociation{Proposals: []Proposal{{
 		Number:     1,
 		ProtocolID: ProtocolESP,
-		SPI:        append([]byte(nil), spi...),
+		SPI:        spiCopy,
 		Transforms: []Transform{
 			{Type: TransformENCR, ID: ENCR_AES_CBC, Attributes: []TransformAttribute{KeyLengthAttribute(128)}},
 			{Type: TransformINTEG, ID: INTEG_HMAC_SHA2_256_128},
 			{Type: TransformESN, ID: ESNNo},
 		},
 	}}}
+}
+
+// comprehensiveESPProposal 返回包含多个 ESP 提议的 CHILD_SA，匹配旧二进制行为。
+// ePDG 可能拒绝单一 ESP 提议（NO_PROPOSAL_CHOSEN），因此提供多种组合供选择。
+func comprehensiveESPProposal(spi []byte) SecurityAssociation {
+	spiCopy := append([]byte(nil), spi...)
+	proposal := func(num uint8, encr uint16, keyLen uint16, integ uint16) Proposal {
+		transforms := []Transform{
+			{Type: TransformENCR, ID: encr, Attributes: []TransformAttribute{KeyLengthAttribute(keyLen)}},
+		}
+		if integ != 0 {
+			transforms = append(transforms, Transform{Type: TransformINTEG, ID: integ})
+		}
+		transforms = append(transforms, Transform{Type: TransformESN, ID: ESNNo})
+		return Proposal{Number: num, ProtocolID: ProtocolESP, SPI: spiCopy, Transforms: transforms}
+	}
+	return SecurityAssociation{Proposals: []Proposal{
+		proposal(1, ENCR_AES_CBC, 128, INTEG_HMAC_SHA2_256_128),   // AES-128-CBC + SHA256
+		proposal(2, ENCR_AES_CBC, 128, INTEG_HMAC_SHA1_96),       // AES-128-CBC + SHA1
+	}}
 }
 
 func (sa SecurityAssociation) MarshalBinary() ([]byte, error) {

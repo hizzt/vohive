@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 
 	"github.com/iniwex5/vowifi-go/engine/sim"
@@ -153,6 +155,37 @@ type EAPIdentityExchange struct {
 	NextMessageID uint32
 }
 
+func dumpAuthPayloadTypes(tag string, payloads []Payload) {
+	for _, p := range payloads {
+		switch p.Type {
+		case PayloadNotify:
+			if len(p.Body) >= 4 {
+				protocolID := p.Body[0]
+				spiSize := p.Body[1]
+				notifyType := binary.BigEndian.Uint16(p.Body[2:4])
+				fmt.Fprintf(os.Stderr, "[swu] %s: NOTIFY protocol=%d spi_size=%d type=%d (0x%04x) body_len=%d body=%x\n", tag, protocolID, spiSize, notifyType, notifyType, len(p.Body), p.Body)
+			} else {
+				fmt.Fprintf(os.Stderr, "[swu] %s: NOTIFY (short body, len=%d body=%x)\n", tag, len(p.Body), p.Body)
+			}
+		case PayloadEAP:
+			if len(p.Body) >= 4 {
+				eapCode := p.Body[0]
+				eapType := p.Body[2]
+				fmt.Fprintf(os.Stderr, "[swu] %s: EAP code=%d type=%d len=%d\n", tag, eapCode, eapType, len(p.Body))
+			} else {
+				fmt.Fprintf(os.Stderr, "[swu] %s: EAP (short body, len=%d)\n", tag, len(p.Body))
+			}
+		case PayloadCP:
+			if len(p.Body) >= 1 {
+				cpType := p.Body[0]
+				fmt.Fprintf(os.Stderr, "[swu] %s: CP type=%d len=%d\n", tag, cpType, len(p.Body))
+			}
+		default:
+			fmt.Fprintf(os.Stderr, "[swu] %s: payload type=%d len=%d\n", tag, p.Type, len(p.Body))
+		}
+	}
+}
+
 func RunIKE_AUTH_EAPIdentity(ctx context.Context, cfg AuthConfig) (AuthResult, error) {
 	if cfg.Transport == nil {
 		return AuthResult{}, fmt.Errorf("%w: transport is nil", ErrInvalidAuthConfig)
@@ -192,6 +225,7 @@ func RunIKE_AUTH_EAPIdentity(ctx context.Context, cfg AuthConfig) (AuthResult, e
 	if err != nil {
 		return AuthResult{}, err
 	}
+	dumpAuthPayloadTypes("IKE_AUTH initial response", initialInnerResp)
 	eapReq, eapReqRaw, hasEAP, err := firstEAPPacketWithRaw(initialInnerResp)
 	if err != nil {
 		return AuthResult{}, err
@@ -243,6 +277,7 @@ func RunIKE_AUTH_EAPIdentity(ctx context.Context, cfg AuthConfig) (AuthResult, e
 	if err != nil {
 		return AuthResult{}, err
 	}
+	dumpAuthPayloadTypes("IKE_AUTH identity response", identityInnerResp)
 	out.IdentityRequestBytes = append([]byte(nil), identityReqBytes...)
 	out.IdentityResponseBytes = append([]byte(nil), identityRespBytes...)
 	out.IdentityResponseInner = clonePayloads(identityInnerResp)
@@ -806,6 +841,9 @@ func BuildIKEAuthInitialPayloads(cfg AuthConfig) ([]Payload, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 调试日志：打印 CHILD_SA 的完整字节
+	saBody, _ := childSA.MarshalBinary()
+	fmt.Fprintf(os.Stderr, "[swu] CHILD_SA proposal (%d proposals, %d bytes): %x\n", len(childSA.Proposals), len(saBody), saBody)
 	tsi := cfg.TSi
 	if len(tsi.Selectors) == 0 {
 		tsi = IPv4AnyTrafficSelectors()
@@ -826,7 +864,23 @@ func BuildIKEAuthInitialPayloads(cfg AuthConfig) ([]Payload, error) {
 	if err != nil {
 		return nil, err
 	}
-	return []Payload{idPayload, cfgPayload, saPayload, tsiPayload, tsrPayload}, nil
+	payloads := []Payload{idPayload, cfgPayload, saPayload, tsiPayload, tsrPayload}
+	if os.Getenv("SWU_DEBUG_AUTH") != "" {
+		var sizes []int
+		for _, p := range payloads {
+			sizes = append(sizes, len(p.Body)+4)
+		}
+		fmt.Fprintf(os.Stderr, "[swu] IKE_AUTH payload sizes: %v (total %d)\n", sizes, sum(sizes))
+	}
+	return payloads, nil
+}
+
+func sum(a []int) int {
+	s := 0
+	for _, v := range a {
+		s += v
+	}
+	return s
 }
 
 func authHeader(init InitResult, messageID uint32, fromInitiator bool) Header {

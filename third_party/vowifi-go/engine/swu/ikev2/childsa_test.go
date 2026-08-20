@@ -16,14 +16,14 @@ func TestDeriveChildSAKeysWithNonces(t *testing.T) {
 		t.Fatalf("direction key length=%d", keys.Profile.DirectionKeyLength())
 	}
 	seed := append(append([]byte(nil), init.NonceI...), init.NonceR...)
-	keymat, err := PRFPlus(init.Keys.Profile.PRF, init.Keys.SKD, seed, 96)
-	if err != nil {
-		t.Fatalf("PRFPlus() error = %v", err)
-	}
-	if !bytes.Equal(keys.Outbound.EncryptionKey, keymat[:16]) ||
-		!bytes.Equal(keys.Outbound.IntegrityKey, keymat[16:48]) ||
-		!bytes.Equal(keys.Inbound.EncryptionKey, keymat[48:64]) ||
-		!bytes.Equal(keys.Inbound.IntegrityKey, keymat[64:96]) {
+keymat, err := PRFPlus(init.Keys.Profile.PRF, init.Keys.SKD, seed, 96)
+		if err != nil {
+			t.Fatalf("PRFPlus() error = %v", err)
+		}
+		if !bytes.Equal(keys.Outbound.EncryptionKey, keymat[:16]) ||
+			!bytes.Equal(keys.Outbound.IntegrityKey, keymat[16:48]) ||
+			!bytes.Equal(keys.Inbound.EncryptionKey, keymat[48:64]) ||
+			!bytes.Equal(keys.Inbound.IntegrityKey, keymat[64:96]) {
 		t.Fatalf("keys=%+v keymat=%x", keys, keymat)
 	}
 }

@@ -120,7 +120,7 @@ func TestRunIKEAuthEAPIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseSecurityAssociation() error = %v", err)
 	}
-	if len(childSA.Proposals) != 1 || !bytes.Equal(childSA.Proposals[0].SPI, []byte{0xca, 0xfe, 0xba, 0xbe}) {
+	if len(childSA.Proposals) == 0 || !bytes.Equal(childSA.Proposals[0].SPI, []byte{0xca, 0xfe, 0xba, 0xbe}) {
 		t.Fatalf("child SA=%+v", childSA)
 	}
 	if res.EAPRequest == nil || res.EAPRequest.Subtype != eapaka.SubtypeIdentity {

@@ -23,6 +23,7 @@ const (
 var (
 	ErrInvalidInitConfig   = errors.New("invalid ikev2 init config")
 	ErrInvalidInitResponse = errors.New("invalid ikev2 init response")
+	ErrInvalidKEPayload    = errors.New("invalid ke payload: ePDG rejected DH group")
 )
 
 type InitTransport interface {
@@ -297,32 +298,40 @@ func parseInitResponse(resp Message, spiI uint64) (parsedInitResponse, error) {
 	var out parsedInitResponse
 	for _, p := range resp.Payloads {
 		switch p.Type {
-		case PayloadSA:
-			sa, err := ParseSecurityAssociation(p.Body)
-			if err != nil {
-				return parsedInitResponse{}, err
-			}
-			out.sa = sa
-case PayloadKE:
-				ke, err := ParseKeyExchange(p.Body)
-				if err != nil {
-					return parsedInitResponse{}, err
-				}
-				if ke.DHGroup != DHGroupCurve25519 && ke.DHGroup != DHGroup2048BitMODP && ke.DHGroup != DHGroup1024BitMODP {
-					return parsedInitResponse{}, fmt.Errorf("%w: unsupported DH group %d", ErrInvalidInitResponse, ke.DHGroup)
-				}
-				out.keyExchange = ke
-		case PayloadNonce:
-			out.nonceR = append([]byte(nil), p.Body...)
 		case PayloadNotify:
 			n, err := ParseNotify(p.Body)
 			if err != nil {
 				return parsedInitResponse{}, err
 			}
 			out.notifies = append(out.notifies, n)
+			if n.NotifyType == NotifyInvalidKEPayload {
+				// ePDG 接受的协商仅为所有 KE 载荷无效；上层可降级 DH group 重试。
+				return parsedInitResponse{}, ErrInvalidKEPayload
+			}
 			if n.NotifyType == NotifyMOBIKESupported {
 				out.mobikeSupported = true
 			}
+		}
+	}
+	for _, p := range resp.Payloads {
+		switch p.Type {
+		case PayloadSA:
+			sa, err := ParseSecurityAssociation(p.Body)
+			if err != nil {
+				return parsedInitResponse{}, err
+			}
+			out.sa = sa
+		case PayloadKE:
+			ke, err := ParseKeyExchange(p.Body)
+			if err != nil {
+				return parsedInitResponse{}, err
+			}
+			if ke.DHGroup != DHGroupCurve25519 && ke.DHGroup != DHGroup2048BitMODP && ke.DHGroup != DHGroup1024BitMODP {
+				return parsedInitResponse{}, fmt.Errorf("%w: unsupported DH group %d", ErrInvalidInitResponse, ke.DHGroup)
+			}
+			out.keyExchange = ke
+		case PayloadNonce:
+			out.nonceR = append([]byte(nil), p.Body...)
 		}
 	}
 	if len(out.sa.Proposals) == 0 {
