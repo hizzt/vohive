@@ -16,7 +16,7 @@ import (
 )
 
 // Socks5UDPTransport 通过 SOCKS5 UDP Associate 中继 IKE/ESP 流量到 ePDG。
-// 使用 txthinking 做 TCP 握手 + UDP ASSOCIATE，TCP 控制连接在 associate 后立即关闭。
+// 使用 txthinking 做 TCP 握手 + UDP ASSOCIATE，是否保活 TCP 控制连接由 carrier profile 决定。
 // UDP 读写使用手动封装/解封 SOCKS5 数据报（兼容代理行为）。
 type Socks5UDPTransport struct {
 	proxyAddr  string
@@ -35,6 +35,9 @@ type Socks5UDPTransport struct {
 	addresses  []string     // 候选 ePDG 地址列表
 	addrIndex  int
 	useNATT    bool         // NAT 检测后切换到 4500 端口并加 NAT-T marker
+
+	controlConn      net.Conn
+	keepControlAlive bool
 }
 
 var _ ikev2.InitTransport = (*Socks5UDPTransport)(nil)
@@ -60,6 +63,18 @@ func NewSocks5UDPTransport(proxy ProxyConfig, remoteAddrs []string, localAddr st
 		t.timeout = 8 * time.Second
 	}
 	return t
+}
+
+func (t *Socks5UDPTransport) SetKeepControlAlive(keep bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.keepControlAlive = keep
+}
+
+func (t *Socks5UDPTransport) KeepControlAlive() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.keepControlAlive
 }
 
 // Connect 建立 SOCKS5 UDP Associate 会话。
@@ -113,9 +128,13 @@ func (t *Socks5UDPTransport) dialAddr(ctx context.Context, addr string) error {
 	}
 	t.udpConn = udpConn
 
-	// 关键：关闭 TCP 控制连接（旧二进制行为：UDP ASSOCIATE 后立即 FIN）
-	if cl.TCPConn != nil {
-		cl.TCPConn.Close()
+	if t.keepControlAlive {
+		t.controlConn = cl.TCPConn
+	} else {
+		if cl.TCPConn != nil {
+			cl.TCPConn.Close()
+		}
+		t.controlConn = nil
 	}
 
 	t.remoteAddr = addr
@@ -293,6 +312,10 @@ func (t *Socks5UDPTransport) closeConn() {
 	if t.udpConn != nil {
 		_ = t.udpConn.Close()
 		t.udpConn = nil
+	}
+	if t.controlConn != nil {
+		_ = t.controlConn.Close()
+		t.controlConn = nil
 	}
 	if t.client != nil {
 		_ = t.client.Close()

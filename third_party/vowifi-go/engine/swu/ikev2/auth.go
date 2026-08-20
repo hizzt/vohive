@@ -156,6 +156,9 @@ type EAPIdentityExchange struct {
 }
 
 func dumpAuthPayloadTypes(tag string, payloads []Payload) {
+	if os.Getenv("SWU_DEBUG_AUTH") == "" && os.Getenv("SWU_DEBUG_IKE") == "" {
+		return
+	}
 	for _, p := range payloads {
 		switch p.Type {
 		case PayloadNotify:

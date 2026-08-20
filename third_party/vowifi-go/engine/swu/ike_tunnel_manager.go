@@ -523,11 +523,13 @@ func (m *IKEPacketTunnelManager) ikeTransport(cfg TunnelConfig, transportCfg IKE
 		return m.Config.IKETransportFactory(cfg, transportCfg)
 	}
 	if m.socks5Transport != nil || socks5ProxyEnabled(cfg.Proxy) {
+		prof := m.carrierProfile(cfg)
 		if m.socks5Transport == nil {
 			m.socks5Transport = NewSocks5UDPTransport(
 				*cfg.Proxy, transportCfg.RemoteAddrs, transportCfg.LocalAddr, transportCfg.Timeout,
 			)
 		}
+		m.socks5Transport.SetKeepControlAlive(prof.Transport.EffectiveKeepSOCKSControlAlive())
 		return m.socks5Transport, nil
 	}
 	return ikev2.UDPTransport{
@@ -546,11 +548,13 @@ func (m *IKEPacketTunnelManager) espTransport(cfg TunnelConfig, transportCfg ESP
 		return m.Config.ESPTransportFactory(cfg, transportCfg)
 	}
 	if m.socks5Transport != nil || socks5ProxyEnabled(cfg.Proxy) {
+		prof := m.carrierProfile(cfg)
 		if m.socks5Transport == nil {
 			m.socks5Transport = NewSocks5UDPTransport(
 				*cfg.Proxy, transportCfg.RemoteAddrs, transportCfg.LocalAddr, transportCfg.Timeout,
 			)
 		}
+		m.socks5Transport.SetKeepControlAlive(prof.Transport.EffectiveKeepSOCKSControlAlive())
 		return m.socks5Transport, nil
 	}
 	return &UDPESPPacketTransport{
