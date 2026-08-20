@@ -15,22 +15,38 @@ const (
 )
 
 const (
-	NotifyInvalidKEPayload          uint16 = 17
-	NotifyUnacceptableAddresses     uint16 = 40
-	NotifyUnexpectedNATDetected     uint16 = 41
-	NotifyNATDetectionSourceIP      uint16 = 16388
-	NotifyNATDetectionDestinationIP uint16 = 16389
-	NotifyRekeySA                   uint16 = 16393
-	NotifyMOBIKESupported           uint16 = 16396
-	NotifyAdditionalIPv4Address     uint16 = 16397
-	NotifyAdditionalIPv6Address     uint16 = 16398
-	NotifyNoAdditionalAddresses     uint16 = 16399
-	NotifyUpdateSAAddresses         uint16 = 16400
-	NotifyCookie2                   uint16 = 16401
-	NotifyNoNATsAllowed             uint16 = 16402
+	NotifyUnsupportedCriticalPayload uint16 = 1
+	NotifyInvalidIKESPI              uint16 = 4
+	NotifyInvalidMajorVersion        uint16 = 5
+	NotifyInvalidSyntax              uint16 = 7
+	NotifyInvalidMessageID           uint16 = 9
+	NotifyInvalidSPI                 uint16 = 11
+	NotifyNoProposalChosen           uint16 = 14
+	NotifyInvalidKEPayload           uint16 = 17
+	NotifyAuthenticationFailed       uint16 = 24
+	NotifySinglePairRequired         uint16 = 34
+	NotifyNoAdditionalSAs            uint16 = 35
+	NotifyInternalAddressFailure     uint16 = 36
+	NotifyFailedCPRequired           uint16 = 37
+	NotifyTSUnacceptable             uint16 = 38
+	NotifyInvalidSelectors           uint16 = 39
+	NotifyUnacceptableAddresses      uint16 = 40
+	NotifyUnexpectedNATDetected      uint16 = 41
+	NotifyNATDetectionSourceIP       uint16 = 16388
+	NotifyNATDetectionDestinationIP  uint16 = 16389
+	NotifyCookie                     uint16 = 16390
+	NotifyRekeySA                    uint16 = 16393
+	NotifyMOBIKESupported            uint16 = 16396
+	NotifyAdditionalIPv4Address      uint16 = 16397
+	NotifyAdditionalIPv6Address      uint16 = 16398
+	NotifyNoAdditionalAddresses      uint16 = 16399
+	NotifyUpdateSAAddresses          uint16 = 16400
+	NotifyCookie2                    uint16 = 16401
+	NotifyNoNATsAllowed              uint16 = 16402
 )
 
 const (
+	MaxIKECookieLength        = 64
 	DHGroup2048BitMODP uint16 = 14
 	DHGroup1024BitMODP uint16 = 2
 	DHGroup256BitECP   uint16 = 19
@@ -40,16 +56,151 @@ const (
 )
 
 var (
-	ErrInvalidNotify  = errors.New("invalid ikev2 notify payload")
-	ErrInvalidDelete  = errors.New("invalid ikev2 delete payload")
-	ErrInvalidAddress = errors.New("invalid ikev2 address")
+	ErrInvalidNotify                    = errors.New("invalid ikev2 notify payload")
+	ErrIKEv2NotifyError                 = errors.New("ikev2 notify error")
+	ErrNotifyUnsupportedCriticalPayload = errors.New("ikev2 unsupported critical payload notify")
+	ErrNotifyInvalidIKESPI              = errors.New("ikev2 invalid ike spi notify")
+	ErrNotifyInvalidMajorVersion        = errors.New("ikev2 invalid major version notify")
+	ErrNotifyInvalidSyntax              = errors.New("ikev2 invalid syntax notify")
+	ErrNotifyInvalidMessageID           = errors.New("ikev2 invalid message id notify")
+	ErrNotifyInvalidSPI                 = errors.New("ikev2 invalid spi notify")
+	ErrNotifyNoProposalChosen           = errors.New("ikev2 no proposal chosen notify")
+	ErrNotifyInvalidKEPayload           = errors.New("ikev2 invalid ke payload notify")
+	ErrNotifyAuthenticationFailed       = errors.New("ikev2 authentication failed notify")
+	ErrNotifySinglePairRequired         = errors.New("ikev2 single pair required notify")
+	ErrNotifyNoAdditionalSAs            = errors.New("ikev2 no additional sas notify")
+	ErrNotifyInternalAddressFailure     = errors.New("ikev2 internal address failure notify")
+	ErrNotifyFailedCPRequired           = errors.New("ikev2 failed cp required notify")
+	ErrNotifyTSUnacceptable             = errors.New("ikev2 ts unacceptable notify")
+	ErrNotifyInvalidSelectors           = errors.New("ikev2 invalid selectors notify")
+	ErrNotifyUnacceptableAddresses      = errors.New("ikev2 unacceptable addresses notify")
+	ErrNotifyUnexpectedNATDetected      = errors.New("ikev2 unexpected nat detected notify")
+	ErrInvalidDelete                    = errors.New("invalid ikev2 delete payload")
+	ErrInvalidAddress                   = errors.New("invalid ikev2 address")
 )
+
+// ErrInvalidKEPayload is an alias for ErrNotifyInvalidKEPayload kept for backwards compatibility.
+var ErrInvalidKEPayload = ErrNotifyInvalidKEPayload
 
 type Notify struct {
 	ProtocolID       uint8
 	NotifyType       uint16
 	SPI              []byte
 	NotificationData []byte
+}
+
+type InvalidSelectorReport struct {
+	ProtocolID   uint8
+	SPI          []byte
+	PacketPrefix []byte
+}
+
+type NotifyError struct {
+	Notify Notify
+	Err    error
+}
+
+func (e *NotifyError) Error() string {
+	if e == nil {
+		return "<nil>"
+	}
+	return fmt.Sprintf("%s: %s", ErrIKEv2NotifyError, NotifyTypeName(e.Notify.NotifyType))
+}
+
+func (e *NotifyError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+func (e *NotifyError) Is(target error) bool {
+	return target == ErrIKEv2NotifyError || target == e.Err
+}
+
+// InvalidKEPayloadAlternativeGroup returns the responder's suggested DH group
+// when this notification is INVALID_KE_PAYLOAD.
+func (n Notify) InvalidKEPayloadAlternativeGroup() (uint16, bool, error) {
+	if n.NotifyType != NotifyInvalidKEPayload {
+		return 0, false, nil
+	}
+	if len(n.NotificationData) != 2 {
+		return 0, true, fmt.Errorf("%w: INVALID_KE_PAYLOAD alternative group length %d", ErrInvalidNotify, len(n.NotificationData))
+	}
+	return binary.BigEndian.Uint16(n.NotificationData), true, nil
+}
+
+// InvalidKEPayloadAlternativeGroup returns the suggested DH group carried by an
+// INVALID_KE_PAYLOAD notify error.
+func (e *NotifyError) InvalidKEPayloadAlternativeGroup() (uint16, bool, error) {
+	if e == nil {
+		return 0, false, nil
+	}
+	return e.Notify.InvalidKEPayloadAlternativeGroup()
+}
+
+// InvalidKEPayloadAlternativeGroupFromError extracts an INVALID_KE_PAYLOAD
+// suggested DH group from a wrapped NotifyError.
+func InvalidKEPayloadAlternativeGroupFromError(err error) (uint16, bool, error) {
+	if err == nil {
+		return 0, false, nil
+	}
+	var notifyErr *NotifyError
+	if !errors.As(err, &notifyErr) {
+		return 0, false, nil
+	}
+	return notifyErr.InvalidKEPayloadAlternativeGroup()
+}
+
+func (n Notify) InvalidSelectorReport() (InvalidSelectorReport, bool, error) {
+	if n.NotifyType != NotifyInvalidSelectors {
+		return InvalidSelectorReport{}, false, nil
+	}
+	if n.ProtocolID != ProtocolAH && n.ProtocolID != ProtocolESP {
+		return InvalidSelectorReport{}, true, fmt.Errorf("%w: INVALID_SELECTORS protocol %d", ErrInvalidNotify, n.ProtocolID)
+	}
+	if len(n.SPI) != 4 {
+		return InvalidSelectorReport{}, true, fmt.Errorf("%w: INVALID_SELECTORS spi length %d", ErrInvalidNotify, len(n.SPI))
+	}
+	if len(n.NotificationData) == 0 {
+		return InvalidSelectorReport{}, true, fmt.Errorf("%w: INVALID_SELECTORS missing packet prefix", ErrInvalidNotify)
+	}
+	return InvalidSelectorReport{
+		ProtocolID:   n.ProtocolID,
+		SPI:          append([]byte(nil), n.SPI...),
+		PacketPrefix: append([]byte(nil), n.NotificationData...),
+	}, true, nil
+}
+
+func (e *NotifyError) InvalidSelectorReport() (InvalidSelectorReport, bool, error) {
+	if e == nil {
+		return InvalidSelectorReport{}, false, nil
+	}
+	return e.Notify.InvalidSelectorReport()
+}
+
+func InvalidSelectorReportFromError(err error) (InvalidSelectorReport, bool, error) {
+	if err == nil {
+		return InvalidSelectorReport{}, false, nil
+	}
+	var notifyErr *NotifyError
+	if !errors.As(err, &notifyErr) {
+		return InvalidSelectorReport{}, false, nil
+	}
+	return notifyErr.InvalidSelectorReport()
+}
+
+func (n Notify) Cookie() ([]byte, bool, error) {
+	if n.NotifyType != NotifyCookie {
+		return nil, false, nil
+	}
+	if len(n.SPI) != 0 {
+		return nil, true, fmt.Errorf("%w: COOKIE spi length %d", ErrInvalidNotify, len(n.SPI))
+	}
+	if len(n.NotificationData) == 0 || len(n.NotificationData) > MaxIKECookieLength {
+		return nil, true, fmt.Errorf("%w: COOKIE length %d", ErrInvalidNotify, len(n.NotificationData))
+	}
+	return append([]byte(nil), n.NotificationData...), true, nil
 }
 
 func (n Notify) MarshalBinary() ([]byte, error) {
@@ -87,6 +238,137 @@ func NotifyPayload(n Notify) (Payload, error) {
 		return Payload{}, err
 	}
 	return Payload{Type: PayloadNotify, Body: body}, nil
+}
+
+func NotifyErrorFor(n Notify) error {
+	err := notifyErrorClass(n.NotifyType)
+	if err == nil {
+		return nil
+	}
+	return &NotifyError{Notify: cloneNotify(n), Err: err}
+}
+
+func FirstNotifyError(payloads []Payload) error {
+	for _, payload := range payloads {
+		if payload.Type != PayloadNotify {
+			continue
+		}
+		notify, err := ParseNotify(payload.Body)
+		if err != nil {
+			return err
+		}
+		if err := NotifyErrorFor(notify); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func NotifyTypeName(notifyType uint16) string {
+	switch notifyType {
+	case NotifyUnsupportedCriticalPayload:
+		return "UNSUPPORTED_CRITICAL_PAYLOAD"
+	case NotifyInvalidIKESPI:
+		return "INVALID_IKE_SPI"
+	case NotifyInvalidMajorVersion:
+		return "INVALID_MAJOR_VERSION"
+	case NotifyInvalidSyntax:
+		return "INVALID_SYNTAX"
+	case NotifyInvalidMessageID:
+		return "INVALID_MESSAGE_ID"
+	case NotifyInvalidSPI:
+		return "INVALID_SPI"
+	case NotifyNoProposalChosen:
+		return "NO_PROPOSAL_CHOSEN"
+	case NotifyInvalidKEPayload:
+		return "INVALID_KE_PAYLOAD"
+	case NotifyAuthenticationFailed:
+		return "AUTHENTICATION_FAILED"
+	case NotifySinglePairRequired:
+		return "SINGLE_PAIR_REQUIRED"
+	case NotifyNoAdditionalSAs:
+		return "NO_ADDITIONAL_SAS"
+	case NotifyInternalAddressFailure:
+		return "INTERNAL_ADDRESS_FAILURE"
+	case NotifyFailedCPRequired:
+		return "FAILED_CP_REQUIRED"
+	case NotifyTSUnacceptable:
+		return "TS_UNACCEPTABLE"
+	case NotifyInvalidSelectors:
+		return "INVALID_SELECTORS"
+	case NotifyUnacceptableAddresses:
+		return "UNACCEPTABLE_ADDRESSES"
+	case NotifyUnexpectedNATDetected:
+		return "UNEXPECTED_NAT_DETECTED"
+	case NotifyNATDetectionSourceIP:
+		return "NAT_DETECTION_SOURCE_IP"
+	case NotifyNATDetectionDestinationIP:
+		return "NAT_DETECTION_DESTINATION_IP"
+	case NotifyCookie:
+		return "COOKIE"
+	case NotifyRekeySA:
+		return "REKEY_SA"
+	case NotifyMOBIKESupported:
+		return "MOBIKE_SUPPORTED"
+	case NotifyAdditionalIPv4Address:
+		return "ADDITIONAL_IP4_ADDRESS"
+	case NotifyAdditionalIPv6Address:
+		return "ADDITIONAL_IP6_ADDRESS"
+	case NotifyNoAdditionalAddresses:
+		return "NO_ADDITIONAL_ADDRESSES"
+	case NotifyUpdateSAAddresses:
+		return "UPDATE_SA_ADDRESSES"
+	case NotifyCookie2:
+		return "COOKIE2"
+	case NotifyNoNATsAllowed:
+		return "NO_NATS_ALLOWED"
+	default:
+		return fmt.Sprintf("notify %d", notifyType)
+	}
+}
+
+func notifyErrorClass(notifyType uint16) error {
+	switch notifyType {
+	case NotifyUnsupportedCriticalPayload:
+		return ErrNotifyUnsupportedCriticalPayload
+	case NotifyInvalidIKESPI:
+		return ErrNotifyInvalidIKESPI
+	case NotifyInvalidMajorVersion:
+		return ErrNotifyInvalidMajorVersion
+	case NotifyInvalidSyntax:
+		return ErrNotifyInvalidSyntax
+	case NotifyInvalidMessageID:
+		return ErrNotifyInvalidMessageID
+	case NotifyInvalidSPI:
+		return ErrNotifyInvalidSPI
+	case NotifyNoProposalChosen:
+		return ErrNotifyNoProposalChosen
+	case NotifyInvalidKEPayload:
+		return ErrNotifyInvalidKEPayload
+	case NotifyAuthenticationFailed:
+		return ErrNotifyAuthenticationFailed
+	case NotifySinglePairRequired:
+		return ErrNotifySinglePairRequired
+	case NotifyNoAdditionalSAs:
+		return ErrNotifyNoAdditionalSAs
+	case NotifyInternalAddressFailure:
+		return ErrNotifyInternalAddressFailure
+	case NotifyFailedCPRequired:
+		return ErrNotifyFailedCPRequired
+	case NotifyTSUnacceptable:
+		return ErrNotifyTSUnacceptable
+	case NotifyInvalidSelectors:
+		return ErrNotifyInvalidSelectors
+	case NotifyUnacceptableAddresses:
+		return ErrNotifyUnacceptableAddresses
+	case NotifyUnexpectedNATDetected:
+		return ErrNotifyUnexpectedNATDetected
+	default:
+		if notifyType < 16384 {
+			return ErrIKEv2NotifyError
+		}
+		return nil
+	}
 }
 
 type Delete struct {
@@ -313,6 +595,18 @@ func Cookie2Notify(cookie []byte) (Payload, error) {
 	return Payload{Type: PayloadNotify, Body: body}, nil
 }
 
+func CookieNotify(cookie []byte) (Payload, error) {
+	notify := Notify{NotifyType: NotifyCookie, NotificationData: append([]byte(nil), cookie...)}
+	if _, _, err := notify.Cookie(); err != nil {
+		return Payload{}, err
+	}
+	body, err := notify.MarshalBinary()
+	if err != nil {
+		return Payload{}, err
+	}
+	return Payload{Type: PayloadNotify, Body: body}, nil
+}
+
 func NotifyWithZeroSPI(notifyType uint16, data []byte) Payload {
 	body, _ := (Notify{NotifyType: notifyType, NotificationData: append([]byte(nil), data...)}).MarshalBinary()
 	return Payload{Type: PayloadNotify, Body: body}
@@ -332,6 +626,15 @@ func FirstNotify(payloads []Payload, notifyType uint16) (Notify, bool, error) {
 		}
 	}
 	return Notify{}, false, nil
+}
+
+func cloneNotify(n Notify) Notify {
+	return Notify{
+		ProtocolID:       n.ProtocolID,
+		NotifyType:       n.NotifyType,
+		SPI:              append([]byte(nil), n.SPI...),
+		NotificationData: append([]byte(nil), n.NotificationData...),
+	}
 }
 
 func appendUint64(dst []byte, v uint64) []byte {

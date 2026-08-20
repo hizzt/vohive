@@ -305,8 +305,10 @@ func parseInitResponse(resp Message, spiI uint64) (parsedInitResponse, error) {
 			}
 			out.notifies = append(out.notifies, n)
 			if n.NotifyType == NotifyInvalidKEPayload {
-				// ePDG 接受的协商仅为所有 KE 载荷无效；上层可降级 DH group 重试。
-				return parsedInitResponse{}, ErrInvalidKEPayload
+				if err := NotifyErrorFor(n); err != nil {
+					return parsedInitResponse{}, err
+				}
+				return parsedInitResponse{}, ErrNotifyInvalidKEPayload
 			}
 			if n.NotifyType == NotifyMOBIKESupported {
 				out.mobikeSupported = true
