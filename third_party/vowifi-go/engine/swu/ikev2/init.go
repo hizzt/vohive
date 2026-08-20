@@ -171,6 +171,14 @@ priv, err := x25519PrivateKey(cfg.X25519PrivateKey, random)
 			kePayload = KeyExchangePayload(DHGroup2048BitMODP, pubB)
 			pubI = pubB
 			privKey = privB
+		case DHGroup1024BitMODP:
+			pubB, privB, err := generateMODP1024Keypair(random)
+			if err != nil {
+				return InitResult{}, err
+			}
+			kePayload = KeyExchangePayload(DHGroup1024BitMODP, pubB)
+			pubI = pubB
+			privKey = privB
 		default:
 			kePayload = KeyExchangePayload(DHGroupCurve25519, pubI)
 		}
@@ -209,6 +217,8 @@ priv, err := x25519PrivateKey(cfg.X25519PrivateKey, random)
 		switch dhGroup {
 		case DHGroup2048BitMODP:
 			shared = modp2048SharedSecret(privKey, parsed.keyExchange.KeyData)
+		case DHGroup1024BitMODP:
+			shared = modp1024SharedSecret(privKey, parsed.keyExchange.KeyData)
 		default:
 			respPub, err := ecdh.X25519().NewPublicKey(parsed.keyExchange.KeyData)
 			if err != nil {
@@ -298,7 +308,7 @@ case PayloadKE:
 				if err != nil {
 					return parsedInitResponse{}, err
 				}
-				if ke.DHGroup != DHGroupCurve25519 && ke.DHGroup != DHGroup2048BitMODP {
+				if ke.DHGroup != DHGroupCurve25519 && ke.DHGroup != DHGroup2048BitMODP && ke.DHGroup != DHGroup1024BitMODP {
 					return parsedInitResponse{}, fmt.Errorf("%w: unsupported DH group %d", ErrInvalidInitResponse, ke.DHGroup)
 				}
 				out.keyExchange = ke
@@ -389,6 +399,9 @@ func x25519PrivateKey(raw []byte, random io.Reader) (*ecdh.PrivateKey, error) {
 // RFC 3526 Group 14 (2048-bit MODP): p = 2^2048 - 2^1984 - 1 + 2^64 * { [2^1918 pi] + 124476 }
 var modp2048Prime *big.Int
 
+// RFC 2409 Group 2 (1024-bit MODP)
+var modp1024Prime *big.Int
+
 func init() {
 	modp2048Prime, _ = new(big.Int).SetString(
 		"FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1"+
@@ -402,13 +415,29 @@ func init() {
 			"E39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9"+
 			"DE2BCBF6955817183995497CEA956AE515D2261898FA0510"+
 			"15728E5A8AACAA68FFFFFFFFFFFFFFFF", 16)
+	modp1024Prime, _ = new(big.Int).SetString(
+		"FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1"+
+			"29024E088A67CC74020BBEA63B139B22514A08798E3404DD"+
+			"EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245"+
+			"E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED"+
+			"EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3D"+
+			"C2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F"+
+			"83655D23DCA3AD961C62F356208552BB9ED529077096966D"+
+			"670C354E4ABC9804F1746C08CA18217C32905E462E36CE3B"+
+			"E39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9"+
+			"DE2BCBF6955817183995497CEA956AE515D2261898FA0510"+
+			"15728E5A8AAAC42DAD33170D04507A33A85521ABDF1CBA64"+
+			"ECFB850458DBEF0A8AEA71575D060C7DB3970F85A6E1E4C7"+
+			"ABF5AE8CDB0933D71E8C94E04A25619DCEE3D2261AD2EE6B"+
+			"F12FFA06D98A0864D87602733EC86A64521F2B18177B200C"+
+			"BBE117577A615D6C770988C0BAD946E208E24FA074E5AB31"+
+			"43DB5BFCE0FD108E4B82D120A93AD2CAFFFFFFFFFFFFFFFF", 16)
 }
 
 func generateMODP2048Keypair(random io.Reader) (pub []byte, priv *big.Int, err error) {
 	if random == nil {
 		random = rand.Reader
 	}
-	// 私钥: 256 位随机数
 	privBytes := make([]byte, 32)
 	if _, err := io.ReadFull(random, privBytes); err != nil {
 		return nil, nil, err
@@ -418,7 +447,6 @@ func generateMODP2048Keypair(random io.Reader) (pub []byte, priv *big.Int, err e
 	if priv.Sign() == 0 {
 		priv.SetInt64(1)
 	}
-	// 公钥: g^a mod p, g=2
 	two := big.NewInt(2)
 	pubBig := new(big.Int).Exp(two, priv, modp2048Prime)
 	pubBytes := make([]byte, 256) // 2048 bits = 256 bytes
@@ -427,13 +455,42 @@ func generateMODP2048Keypair(random io.Reader) (pub []byte, priv *big.Int, err e
 	return pubBytes, priv, nil
 }
 
+func generateMODP1024Keypair(random io.Reader) (pub []byte, priv *big.Int, err error) {
+	if random == nil {
+		random = rand.Reader
+	}
+	privBytes := make([]byte, 32)
+	if _, err := io.ReadFull(random, privBytes); err != nil {
+		return nil, nil, err
+	}
+	priv = new(big.Int).SetBytes(privBytes)
+	priv.Mod(priv, modp1024Prime)
+	if priv.Sign() == 0 {
+		priv.SetInt64(1)
+	}
+	two := big.NewInt(2)
+	pubBig := new(big.Int).Exp(two, priv, modp1024Prime)
+	pubBytes := make([]byte, 128) // 1024 bits = 128 bytes
+	pubFill := pubBig.Bytes()
+	copy(pubBytes[128-len(pubFill):], pubFill)
+	return pubBytes, priv, nil
+}
+
 func modp2048SharedSecret(priv *big.Int, peerPub []byte) []byte {
 	peer := new(big.Int).SetBytes(peerPub)
 	secret := new(big.Int).Exp(peer, priv, modp2048Prime)
-	// 返回 256 字节（2048 位）
 	secretBytes := make([]byte, 256)
 	secretFill := secret.Bytes()
 	copy(secretBytes[256-len(secretFill):], secretFill)
+	return secretBytes
+}
+
+func modp1024SharedSecret(priv *big.Int, peerPub []byte) []byte {
+	peer := new(big.Int).SetBytes(peerPub)
+	secret := new(big.Int).Exp(peer, priv, modp1024Prime)
+	secretBytes := make([]byte, 128)
+	secretFill := secret.Bytes()
+	copy(secretBytes[128-len(secretFill):], secretFill)
 	return secretBytes
 }
 

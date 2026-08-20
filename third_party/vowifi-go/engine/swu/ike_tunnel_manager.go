@@ -168,7 +168,7 @@ init, err := initRunner(ctx, ikev2.InitConfig{
 			Transport:  transport,
 			Random:     random,
 			SA:         sa,
-			DHGroup:    ikev2.DHGroup2048BitMODP,
+			DHGroup:    ikev2.DHGroup1024BitMODP,
 			LocalIP:    transportCfg.LocalIP,
 			LocalPort:  transportCfg.LocalPort,
 			RemoteIP:   transportCfg.RemoteIP,
