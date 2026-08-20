@@ -103,11 +103,12 @@ func TestVodafoneProfileUsesV155(t *testing.T) {
 	if !cfg.IKE.EffectiveRetryOnTimeout() {
 		t.Fatalf("Vodafone should retry on timeout")
 	}
-	if !cfg.Transport.EffectivePrefer4500OnNATOnly() {
-		t.Fatalf("Vodafone should prefer 4500 on NAT")
+	// A 方案（保守回归）：Vodafone 固定走 500，不切 4500，SOCKS 不保活
+	if cfg.Transport.EffectivePrefer4500OnNATOnly() {
+		t.Fatalf("A scheme: Vodafone should NOT prefer 4500 on NAT (expect false)")
 	}
-	if !cfg.Transport.EffectiveKeepSOCKSControlAlive() {
-		t.Fatalf("Vodafone should keep SOCKS control alive")
+	if cfg.Transport.EffectiveKeepSOCKSControlAlive() {
+		t.Fatalf("A scheme: Vodafone should NOT keep SOCKS control alive (expect false)")
 	}
 }
 

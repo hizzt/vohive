@@ -135,8 +135,8 @@ var builtinCarriers = map[string]EffectiveCarrierConfig{
 			NetworkName:    "WLAN",
 		},
 		Transport: CarrierTransportProfile{
-			Prefer4500OnNATOnly:   boolPtr(true),
-			KeepSOCKSControlAlive: boolPtr(true),
+			Prefer4500OnNATOnly:   boolPtr(false),
+			KeepSOCKSControlAlive: boolPtr(false),
 			RequestPCSCF:          boolPtr(false),
 		},
 	},
@@ -159,8 +159,8 @@ var builtinCarriers = map[string]EffectiveCarrierConfig{
 			NetworkName:    "WLAN",
 		},
 		Transport: CarrierTransportProfile{
-			Prefer4500OnNATOnly:   boolPtr(true),
-			KeepSOCKSControlAlive: boolPtr(true),
+			Prefer4500OnNATOnly:   boolPtr(false),
+			KeepSOCKSControlAlive: boolPtr(false),
 		},
 	},
 }
