@@ -116,10 +116,10 @@ var builtinCarriers = map[string]EffectiveCarrierConfig{
 			KeepSOCKSControlAlive: boolPtr(false),
 		},
 	},
-	"23415": {
+	"234015": {
 		MCC:      "234",
 		MNC:      "015",
-		PresetID: "23415",
+		PresetID: "234015",
 		E911: E911Config{
 			Enabled: false,
 		},
@@ -140,10 +140,10 @@ var builtinCarriers = map[string]EffectiveCarrierConfig{
 			RequestPCSCF:          boolPtr(false),
 		},
 	},
-	"23430": {
+	"234030": {
 		MCC:      "234",
 		MNC:      "030",
-		PresetID: "23430",
+		PresetID: "234030",
 		E911: E911Config{
 			Enabled: false,
 		},

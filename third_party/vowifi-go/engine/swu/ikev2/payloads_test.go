@@ -211,3 +211,32 @@ func TestMOBIKENotifyHelpers(t *testing.T) {
 		t.Fatalf("parsedIPv6=%+v", parsedIPv6)
 	}
 }
+
+
+func TestInvalidKEPayloadAlternativeGroup(t *testing.T) {
+	n := Notify{NotifyType: NotifyInvalidKEPayload, NotificationData: []byte{0x00, 0x02}}
+	g, ok, err := n.InvalidKEPayloadAlternativeGroup()
+	if err != nil || !ok || g != 2 {
+		t.Fatalf("want ok group 2, got g=%d ok=%v err=%v", g, ok, err)
+	}
+	// bad length
+	n2 := Notify{NotifyType: NotifyInvalidKEPayload, NotificationData: []byte{0x00}}
+	if _, ok, err := n2.InvalidKEPayloadAlternativeGroup(); !ok || err == nil {
+		t.Fatalf("want ok+err for bad length")
+	}
+	// wrong type
+	n3 := Notify{NotifyType: NotifyNoProposalChosen}
+	if _, ok, _ := n3.InvalidKEPayloadAlternativeGroup(); ok {
+		t.Fatalf("wrong type should not be ok")
+	}
+	// via wrapped error
+	wrapped := NotifyErrorFor(Notify{NotifyType: NotifyInvalidKEPayload, NotificationData: []byte{0x00, 0x0e}})
+	g, ok, err = InvalidKEPayloadAlternativeGroupFromError(wrapped)
+	if err != nil || !ok || g != 14 {
+		t.Fatalf("from error want 14, got g=%d ok=%v err=%v", g, ok, err)
+	}
+	if _, ok, _ := InvalidKEPayloadAlternativeGroupFromError(errors.New("other")); ok {
+		t.Fatalf("non-notify error should not ok")
+	}
+}
+
