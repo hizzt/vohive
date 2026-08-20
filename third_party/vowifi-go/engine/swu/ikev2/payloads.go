@@ -79,8 +79,6 @@ var (
 	ErrInvalidAddress                   = errors.New("invalid ikev2 address")
 )
 
-// ErrInvalidKEPayload is an alias for ErrNotifyInvalidKEPayload kept for backwards compatibility.
-var ErrInvalidKEPayload = ErrNotifyInvalidKEPayload
 
 type Notify struct {
 	ProtocolID       uint8

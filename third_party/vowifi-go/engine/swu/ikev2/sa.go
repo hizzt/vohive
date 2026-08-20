@@ -96,6 +96,10 @@ func DefaultESPProposal(spi []byte) SecurityAssociation {
 
 // comprehensiveESPProposal 返回包含多个 ESP 提议的 CHILD_SA，匹配旧二进制行为。
 // ePDG 可能拒绝单一 ESP 提议（NO_PROPOSAL_CHOSEN），因此提供多种组合供选择。
+func ComprehensiveESPProposal(spi []byte) SecurityAssociation {
+	return comprehensiveESPProposal(spi)
+}
+
 func comprehensiveESPProposal(spi []byte) SecurityAssociation {
 	spiCopy := append([]byte(nil), spi...)
 	proposal := func(num uint8, encr uint16, keyLen uint16, integ uint16) Proposal {

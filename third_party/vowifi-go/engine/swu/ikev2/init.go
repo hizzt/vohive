@@ -305,10 +305,7 @@ func parseInitResponse(resp Message, spiI uint64) (parsedInitResponse, error) {
 			}
 			out.notifies = append(out.notifies, n)
 			if n.NotifyType == NotifyInvalidKEPayload {
-				if err := NotifyErrorFor(n); err != nil {
-					return parsedInitResponse{}, err
-				}
-				return parsedInitResponse{}, ErrNotifyInvalidKEPayload
+				return parsedInitResponse{}, NotifyErrorFor(n)
 			}
 			if n.NotifyType == NotifyMOBIKESupported {
 				out.mobikeSupported = true

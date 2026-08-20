@@ -6,16 +6,17 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-"io"
-		"net"
-		"os"
-		"strconv"
-		"strings"
+	"io"
+	"net"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/iniwex5/vowifi-go/engine/sim"
 	"github.com/iniwex5/vowifi-go/engine/swu/ikev2"
+	"github.com/iniwex5/vowifi-go/runtimehost/carrier"
 )
 
 var ErrInvalidIKETunnelManager = errors.New("invalid swu ike tunnel manager")
@@ -155,35 +156,28 @@ childSPI, err := m.childSPI(random)
 	if err != nil {
 		return nil, err
 	}
-	// 使用更完整的 SA 提议（而非仅 DefaultIKEProposal 的单个提议），
-	// 旧二进制在 swu/session.go 中通过配置文件设置了更多提议。
 	sa := m.Config.SA
 	if len(sa.Proposals) == 0 {
-		sa = comprehensiveIKEProposal()
+		sa = ikeProposalForCarrier(m.carrierProfile(cfg))
 	}
 	initRunner := m.Config.InitRunner
 	if initRunner == nil {
 		initRunner = ikev2.RunIKE_SA_INIT
 	}
-	// https://github.com/autisticryptic/SimMaster 的 live.rs 观察到：
-	// ePDG 可能拒绝 MODP 2048 KE（INVALID_KE_PAYLOAD），要求降级到 MODP 1024。
-	// 每次尝试都使用全新的 SPI、nonce、DH 密钥对，匹配旧二进制重试行为。
-	init, err := m.runIKEInitWithDHFallback(ctx, initRunner, transport, transportCfg, random, sa)
+	init, err := m.runIKEInitWithProfile(ctx, initRunner, transport, transportCfg, random, sa, m.carrierProfile(cfg))
 	if err != nil {
 		return nil, err
 	}
-	// NAT 检测后切换到 4500 端口（NAT-T），IKE 报文需带 4 字节 0x00 marker。
-	// 注意：此功能尚在调试中，临时禁用回归 500 端口验证基本 IKE_AUTH 可通。
-	// v1.5.5 和 SimMaster 在 IKE_SA_INIT 检测到 NAT 后均将后续 IKE_AUTH 发送至 4500。
 	if init.NATDetected {
-		_ = init.NATDetected
-		_ = transport
-		// if natt, ok := transport.(interface{ SwitchToNATT() }); ok {
-		// 	fmt.Fprintf(os.Stderr, "[swu] NAT detected, switching to 4500\n")
-		// 	natt.SwitchToNATT()
-		// } else {
-		// 	fmt.Fprintf(os.Stderr, "[swu] NAT detected but transport does not support SwitchToNATT\n")
-		// }
+		prof := m.carrierProfile(cfg)
+		if prof.Transport.EffectivePrefer4500OnNATOnly() {
+			if natt, ok := transport.(interface{ SwitchToNATT() }); ok {
+				fmt.Fprintf(os.Stderr, "[swu] NAT detected, switching to 4500 (profile %s)\n", prof.PresetID)
+				natt.SwitchToNATT()
+			} else {
+				fmt.Fprintf(os.Stderr, "[swu] NAT detected but transport does not support SwitchToNATT\n")
+			}
+		}
 	}
 	authRunner := m.Config.AuthRunner
 	if authRunner == nil {
@@ -192,6 +186,28 @@ childSPI, err := m.childSPI(random)
 	reauth := m.Config.Reauthentication.clone()
 	if !reauth.Usable() {
 		reauth = EAPReauthenticationState{}
+	}
+	childSA := m.Config.ChildSA
+	if len(childSA.Proposals) == 0 {
+		childSA = espProposalForCarrier(m.carrierProfile(cfg), childSPI)
+	}
+	tsi := m.Config.TSi
+	if len(tsi.Selectors) == 0 {
+		tsi = ikev2.IPv4AnyTrafficSelectors()
+	}
+	tsr := m.Config.TSr
+	if len(tsr.Selectors) == 0 {
+		tsr = ikev2.IPv4AnyTrafficSelectors()
+	}
+	cfgCP := m.Config.Configuration
+	if len(cfgCP.Attributes) == 0 {
+		cfgCP = ikev2.SWuConfigurationRequest()
+		if m.carrierProfile(cfg).Transport.EffectiveRequestPCSCF() {
+			cfgCP.Attributes = append(cfgCP.Attributes,
+				ikev2.ConfigurationAttribute{Type: ikev2.ConfigInternalIPv4Pcscf},
+				ikev2.ConfigurationAttribute{Type: ikev2.ConfigInternalIPv6Pcscf},
+			)
+		}
 	}
 	auth, err := authRunner(ctx, ikev2.FullAuthConfig{
 		Transport:          transport,
@@ -204,11 +220,11 @@ childSPI, err := m.childSPI(random)
 		EAPReauthIdentity:  reauth.Identity,
 		EAPReauthCounter:   reauth.Counter,
 		EAPReauthCounterOK: reauth.CounterOK,
-		ChildSA:            m.Config.ChildSA,
+		ChildSA:            childSA,
 		ChildSPI:           childSPI,
-		TSi:                m.Config.TSi,
-		TSr:                m.Config.TSr,
-		Configuration:      m.Config.Configuration,
+		TSi:                tsi,
+		TSr:                tsr,
+		Configuration:      cfgCP,
 		Random:             random,
 	})
 	if err != nil {
@@ -254,10 +270,35 @@ childSPI, err := m.childSPI(random)
 	return session, nil
 }
 
-// runIKEInitWithDHFallback 优先尝试 MODP 2048，若 ePDG 拒绝该 KE group
-//（INVALID_KE_PAYLOAD），则降级到 MODP 1024 重试，每次使用全新 SPI/nonce/DH。
-// 参考 SimMaster 的 run_live_ike_until_depth（live.rs）行为：
-// 每次尝试都是完全独立的 IKE_SA_INIT 会话（新 SPI、新 nonce、新 DH 密钥对）。
+func (m *IKEPacketTunnelManager) carrierProfile(cfg TunnelConfig) carrier.EffectiveCarrierConfig {
+	mcc, mnc := tunnelMCCMNC(cfg)
+	return carrier.ResolveEffectiveCarrierConfig(carrier.EffectiveCarrierConfigInput{MCC: mcc, MNC: mnc})
+}
+
+func ikeProposalForCarrier(prof carrier.EffectiveCarrierConfig) ikev2.SecurityAssociation {
+	switch prof.IKE.ProposalSet {
+	case "curve25519-single":
+		return ikev2.DefaultIKEProposal()
+	case "modp-mixed":
+		return ikev2.SecurityAssociation{Proposals: []ikev2.Proposal{
+			{Number: 1, ProtocolID: ikev2.ProtocolIKE, Transforms: []ikev2.Transform{
+				{Type: ikev2.TransformENCR, ID: ikev2.ENCR_AES_CBC, Attributes: []ikev2.TransformAttribute{ikev2.KeyLengthAttribute(128)}},
+				{Type: ikev2.TransformPRF, ID: ikev2.PRF_HMAC_SHA2_256},
+				{Type: ikev2.TransformINTEG, ID: ikev2.INTEG_HMAC_SHA2_256_128},
+				{Type: ikev2.TransformDHRGroup, ID: ikev2.DHGroup2048BitMODP},
+			}},
+			{Number: 2, ProtocolID: ikev2.ProtocolIKE, Transforms: []ikev2.Transform{
+				{Type: ikev2.TransformENCR, ID: ikev2.ENCR_AES_CBC, Attributes: []ikev2.TransformAttribute{ikev2.KeyLengthAttribute(128)}},
+				{Type: ikev2.TransformPRF, ID: ikev2.PRF_HMAC_SHA2_256},
+				{Type: ikev2.TransformINTEG, ID: ikev2.INTEG_HMAC_SHA2_256_128},
+				{Type: ikev2.TransformDHRGroup, ID: ikev2.DHGroupCurve25519},
+			}},
+		}}
+	default:
+		return comprehensiveIKEProposal()
+	}
+}
+
 func (m *IKEPacketTunnelManager) runIKEInitWithDHFallback(
 	ctx context.Context,
 	initRunner IKEInitRunner,
@@ -266,13 +307,29 @@ func (m *IKEPacketTunnelManager) runIKEInitWithDHFallback(
 	random io.Reader,
 	sa ikev2.SecurityAssociation,
 ) (ikev2.InitResult, error) {
+	return m.runIKEInitWithProfile(ctx, initRunner, transport, transportCfg, random, sa, m.carrierProfile(TunnelConfig{}))
+}
+
+func (m *IKEPacketTunnelManager) runIKEInitWithProfile(
+	ctx context.Context,
+	initRunner IKEInitRunner,
+	transport ikev2.InitTransport,
+	transportCfg IKETransportConfig,
+	random io.Reader,
+	sa ikev2.SecurityAssociation,
+	prof carrier.EffectiveCarrierConfig,
+) (ikev2.InitResult, error) {
+	dhGroups := prof.IKE.DHGroups
+	if len(dhGroups) == 0 {
+		dhGroups = []uint16{ikev2.DHGroup2048BitMODP, ikev2.DHGroup1024BitMODP}
+	}
 	type dhAttempt struct {
 		group uint16
 		name  string
 	}
-	attempts := []dhAttempt{
-		{ikev2.DHGroup2048BitMODP, "MODP 2048"},
-		{ikev2.DHGroup1024BitMODP, "MODP 1024"},
+	attempts := make([]dhAttempt, 0, len(dhGroups))
+	for _, g := range dhGroups {
+		attempts = append(attempts, dhAttempt{group: g, name: dhGroupName(g)})
 	}
 
 	var lastErr error
@@ -282,8 +339,8 @@ func (m *IKEPacketTunnelManager) runIKEInitWithDHFallback(
 			lastErr = fmt.Errorf("no proposals match DH group %d", a.group)
 			continue
 		}
-result, err := initRunner(ctx, ikev2.InitConfig{
-				Transport:  transport,
+		result, err := initRunner(ctx, ikev2.InitConfig{
+				Transport: transport,
 				Random:     random,
 				SA:         filtered,
 				DHGroup:    a.group,
@@ -297,12 +354,14 @@ result, err := initRunner(ctx, ikev2.InitConfig{
 				return result, nil
 			}
 			lastErr = err
-			if isIKEInitRetryableError(err) {
+			if sg, ok, _ := ikev2.InvalidKEPayloadAlternativeGroupFromError(err); ok {
+				fmt.Fprintf(os.Stderr, "[swu] ePDG suggested DH group %s (%d), will prefer it if available\n", dhGroupName(sg), sg)
+			}
+			if isIKEInitRetryableErrorForProfile(err, prof) {
 				fmt.Fprintf(os.Stderr, "[swu] IKE_SA_INIT DH group %s failed (%v), retrying next group\n", a.name, err)
 				continue
 			}
-		// 非可重试错误，直接返回
-		return ikev2.InitResult{}, err
+			return ikev2.InitResult{}, err
 	}
 	return ikev2.InitResult{}, lastErr
 }
@@ -310,13 +369,19 @@ result, err := initRunner(ctx, ikev2.InitConfig{
 // isIKEInitRetryableError 判断 IKE_SA_INIT 错误是否应降级重试。
 // ePDG 可能拒绝 KE group（INVALID_KE_PAYLOAD）或直接超时，都应换 group 尝试。
 func isIKEInitRetryableError(err error) bool {
-	if errors.Is(err, ikev2.ErrInvalidKEPayload) {
+	return isIKEInitRetryableErrorForProfile(err, carrier.EffectiveCarrierConfig{IKE: carrier.CarrierIKEProfile{RetryOnTimeout: func() *bool { b := true; return &b }()}})
+}
+
+func isIKEInitRetryableErrorForProfile(err error, prof carrier.EffectiveCarrierConfig) bool {
+	if errors.Is(err, ikev2.ErrInvalidKEPayload) || errors.Is(err, ikev2.ErrNotifyInvalidKEPayload) {
 		return true
 	}
-	// 网络层超时也视为可降级重试：ePDG 可能丢弃不支持的 KE 而不回包
+	if _, ok, _ := ikev2.InvalidKEPayloadAlternativeGroupFromError(err); ok {
+		return true
+	}
 	var netErr net.Error
 	if errors.As(err, &netErr) && netErr.Timeout() {
-		return true
+		return prof.IKE.EffectiveRetryOnTimeout()
 	}
 	return false
 }
@@ -805,6 +870,28 @@ func ikeKeysUsable(keys ikev2.IKEKeys) bool {
 // comprehensiveIKEProposal 返回包含多个提议的 IKE SA，匹配旧二进制 swu/session.go 的配置。
 // 从旧二进制抓包逐字节验证：4 个提议的 transform 必须完全一致，
 // 否则 ePDG 可能静默丢弃 IKE_SA_INIT（不回 NO_PROPOSAL_CHOSEN）。
+func dhGroupName(g uint16) string {
+	switch g {
+	case ikev2.DHGroupCurve25519:
+		return "Curve25519"
+	case ikev2.DHGroup2048BitMODP:
+		return "MODP 2048"
+	case ikev2.DHGroup1024BitMODP:
+		return "MODP 1024"
+	default:
+		return fmt.Sprintf("DH-%d", g)
+	}
+}
+
+func espProposalForCarrier(prof carrier.EffectiveCarrierConfig, spi []byte) ikev2.SecurityAssociation {
+	switch prof.IKE.ProposalSet {
+	case "curve25519-single":
+		return ikev2.DefaultESPProposal(spi)
+	default:
+		return ikev2.ComprehensiveESPProposal(spi)
+	}
+}
+
 func comprehensiveIKEProposal() ikev2.SecurityAssociation {
 	prop := func(num uint8, dhGroup uint16) ikev2.Proposal {
 		encr := ikev2.Transform{Type: ikev2.TransformENCR, ID: ikev2.ENCR_AES_CBC,
