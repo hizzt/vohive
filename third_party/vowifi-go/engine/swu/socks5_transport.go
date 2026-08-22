@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/iniwex5/vowifi-go/engine/swu/ikev2"
@@ -20,17 +21,17 @@ import (
 // 使用 txthinking 做 TCP 握手 + UDP ASSOCIATE，是否保活 TCP 控制连接由 carrier profile 决定。
 // UDP 读写使用手动封装/解封 SOCKS5 数据报（兼容代理行为）。
 type Socks5UDPTransport struct {
-	proxyAddr  string
-	username   string
-	password   string
-	localAddr  string
-	timeout    time.Duration
+	proxyAddr string
+	username  string
+	password  string
+	localAddr string
+	timeout   time.Duration
 
-	mu       sync.Mutex
-	client   *socks5.Client
-	udpConn  *net.UDPConn       // 手动 UDP 连接（非 txthinking 的 conn）
-	relayEP  *net.UDPAddr
-	closed   bool
+	mu      sync.Mutex
+	client  *socks5.Client
+	udpConn *net.UDPConn // 手动 UDP 连接（非 txthinking 的 conn）
+	relayEP *net.UDPAddr
+	closed  bool
 
 	// exchangeMu 串行化 IKE 请求-响应交换。DPD liveness（60s 周期）与上层
 	// MOBIKE 漫游（公网 IP 轮询检测）可能并发调用 ExchangeIKE；两个读循环
@@ -40,10 +41,19 @@ type Socks5UDPTransport struct {
 	// 等前一个完成（重传兜底）再发，天然互不干扰。
 	exchangeMu sync.Mutex
 
-	remoteAddr string       // 当前活跃的 ePDG 地址
-	addresses  []string     // 候选 ePDG 地址列表
+	remoteAddr string   // 当前活跃的 ePDG 地址
+	addresses  []string // 候选 ePDG 地址列表
 	addrIndex  int
-	useNATT    bool         // NAT 检测后切换到 4500 端口并加 NAT-T marker
+	useNATT    bool // NAT 检测后切换到 4500 端口并加 NAT-T marker
+
+	// lastInboundAt 记录最近一次收到代理下行数据报的时间（任意读方：
+	// ExchangeIKE 的交换读循环或 ReadESPPacket 的 pump 读循环——两个
+	// goroutine 各自 ReadFromUDP 同一 socket，内核只把包投给其中一个，
+	// pump 视角看不到 ExchangeIKE 收走的 IKE 响应）。ReadESPPacket 的
+	// 5min 空闲死链判定以它为准，否则 DPD 响应被 ExchangeIKE 消费后
+	// pump 仍判"无下行"误拆健康会话（设备实测：DPD 1s 回包，8s 后 pump
+	// 仍报 5min 空闲超时）。
+	lastInboundAt atomic.Value // time.Time
 
 	controlConn      net.Conn
 	keepControlAlive bool
@@ -195,13 +205,13 @@ func (t *Socks5UDPTransport) ExchangeIKE(ctx context.Context, request []byte) ([
 			}
 		}
 
-// 如果 NAT 检测到需要 NAT-T，IKE 报文前加 4 字节 0x00 marker
-			ikeData := request
-			if t.useNATT {
-				ikeData = append([]byte{0, 0, 0, 0}, request...)
-			}
-			// 手动封装 SOCKS5 UDP 数据报
-			dgram := socks5WrapUDPDatagram(addr, ikeData)
+		// 如果 NAT 检测到需要 NAT-T，IKE 报文前加 4 字节 0x00 marker
+		ikeData := request
+		if t.useNATT {
+			ikeData = append([]byte{0, 0, 0, 0}, request...)
+		}
+		// 手动封装 SOCKS5 UDP 数据报
+		dgram := socks5WrapUDPDatagram(addr, ikeData)
 		if _, err := udpConn.WriteToUDP(dgram, relayEP); err != nil {
 			lastErr = fmt.Errorf("socks5 IKE 发送失败: %w", err)
 			continue
@@ -258,6 +268,7 @@ func (t *Socks5UDPTransport) ExchangeIKE(ctx context.Context, request []byte) ([
 				continue
 			}
 			_ = dstAddr
+			t.noteInboundDatagram() // ExchangeIKE 收到的响应对 pump 的空闲判定同样有效
 			// NAT-T 模式下响应报文也带 4 字节 0x00 marker，剥离后返回 IKE 报文
 			if t.useNATT && len(p) >= 4 && p[0] == 0 && p[1] == 0 && p[2] == 0 && p[3] == 0 {
 				p = p[4:]
@@ -376,6 +387,19 @@ func isReadTimeout(err error) bool {
 	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
+// noteInboundDatagram 在任意读方收到代理下行数据报时刷新共享下行时间戳。
+func (t *Socks5UDPTransport) noteInboundDatagram() {
+	t.lastInboundAt.Store(time.Now())
+}
+
+// LastInboundAt 返回最近一次下行数据报时间（从未收到过返回零值）。
+func (t *Socks5UDPTransport) LastInboundAt() time.Time {
+	if v, ok := t.lastInboundAt.Load().(time.Time); ok {
+		return v
+	}
+	return time.Time{}
+}
+
 // SendESPPacket 通过 SOCKS5 UDP Associate 中继一个 ESP 数据包。
 func (t *Socks5UDPTransport) SendESPPacket(ctx context.Context, data []byte) error {
 	t.mu.Lock()
@@ -409,6 +433,12 @@ func (t *Socks5UDPTransport) ReadESPPacket(ctx context.Context) ([]byte, error) 
 	}
 	lastKeepalive := time.Now()
 	idleStart := time.Now()
+	// 空闲基准并入共享下行时间戳：ExchangeIKE 读走的 IKE 响应同样证明链路活
+	// （DPD 响应被交换循环消费后 pump 自己的 idleStart 不再更新，5min 死链
+	// 判定会误拆——设备实测 14:44:04 DPD 1s 得到响应、14:44:12 pump 仍报超时）。
+	if last := t.LastInboundAt(); !last.IsZero() {
+		idleStart = last
+	}
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -422,6 +452,9 @@ func (t *Socks5UDPTransport) ReadESPPacket(ctx context.Context) ([]byte, error) 
 		n, _, err := udpConn.ReadFromUDP(buf)
 		if err != nil {
 			if isReadTimeout(err) && ctx.Err() == nil {
+				if shared := t.LastInboundAt(); shared.After(idleStart) {
+					idleStart = shared // 其他读方（ExchangeIKE）刚收到下行
+				}
 				if time.Since(idleStart) >= nattIdleSessionTimeout {
 					return nil, fmt.Errorf("socks5 ESP 空闲超时（%v 无下行流量）", nattIdleSessionTimeout)
 				}
@@ -440,6 +473,7 @@ func (t *Socks5UDPTransport) ReadESPPacket(ctx context.Context) ([]byte, error) 
 		if !ok {
 			continue
 		}
+		t.noteInboundDatagram()
 		if len(payload) == 1 && payload[0] == 0xff {
 			// 对端 NAT-T keepalive：丢弃继续读。对端还在发 keepalive
 			// 即链路存活，刷新空闲基准，防止健康空闲会话被 5min 死链判定误拆。
