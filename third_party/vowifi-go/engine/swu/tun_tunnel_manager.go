@@ -59,6 +59,17 @@ type TUNPacketTunnelSession struct {
 
 var _ TunnelManager = (*TUNTunnelManager)(nil)
 var _ TunnelSession = (*TUNPacketTunnelSession)(nil)
+var _ PSCFRestoreNotifier = (*TUNPacketTunnelSession)(nil)
+
+// SetOnPSCFRestore 转发给内层 PacketSession（responder 在其上）。
+func (t *TUNPacketTunnelSession) SetOnPSCFRestore(fn func(newPSCF string)) {
+	if t == nil {
+		return
+	}
+	if base, ok := t.base.(*PacketSession); ok {
+		base.SetOnPSCFRestore(fn)
+	}
+}
 
 func NewTUNTunnelManager(cfg TUNTunnelManagerConfig) *TUNTunnelManager {
 	return &TUNTunnelManager{Config: cfg}
@@ -141,6 +152,7 @@ func (m *TUNTunnelManager) EstablishTunnel(ctx context.Context, cfg TunnelConfig
 	// INFORMATIONAL 探测在本环境 ~40s 后被 ePDG 无视，ESP 层探测始终有效。
 	if livenessSession, ok := packetSession.(*PacketSession); ok {
 		livenessSession.StartLivenessLoop(context.Background())
+		livenessSession.StartRekeyLoop(context.Background())
 	}
 	return &TUNPacketTunnelSession{
 		base:           packetSession,

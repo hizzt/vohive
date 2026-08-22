@@ -29,8 +29,21 @@ type IKEResponder struct {
 	onPSCFRestore func(string)
 	closed        bool
 
+	// 请求去重缓存（RFC 7296 §2.1 响应方重传规则）：ePDG 重传同一
+	// (exchange, msgid) 请求时直接重发缓存响应，副作用（DELETE 回调、
+	// P-CSCF 重注册）只执行一次。容量 8 足够覆盖 ePDG 在途重传窗口。
+	dedupKeys  []dedupKey
+	dedupCache map[dedupKey][]byte
+
 	send func([]byte) error // 经原 relay/端口发出（nil = 未接线，丢弃请求）
 }
+
+type dedupKey struct {
+	exchange uint8
+	msgID    uint32
+}
+
+const responderDedupCapacity = 8
 
 // NewIKEResponder 构造应答方。send 回调用 SendESPPacket 同一 socket 发出。
 func NewIKEResponder(init ikev2.InitResult, keys ikev2.IKEKeys, imei string, send func([]byte) error) *IKEResponder {
@@ -129,6 +142,21 @@ func (r *IKEResponder) HandleInbound(ctx context.Context, packet []byte) bool {
 		// 丢弃即可，不消费对端 ESP 流。
 		if os.Getenv("SWU_DEBUG_IKE") != "" {
 			fmt.Fprintf(os.Stderr, "[swu] IKE responder: dropping late/dup response msgid=%d\n", header.MessageID)
+		}
+		return true
+	}
+	// 对端请求：先查去重缓存——重复请求（ePDG 未收到我方响应而重传）直接
+	// 重发缓存响应，不重跑副作用（对齐 Python 参考 _dispatch_epdg_request）。
+	dedup := dedupKey{exchange: header.ExchangeType, msgID: header.MessageID}
+	r.mu.Lock()
+	cached, dup := r.dedupCache[dedup]
+	r.mu.Unlock()
+	if dup {
+		if os.Getenv("SWU_DEBUG_IKE") != "" {
+			fmt.Fprintf(os.Stderr, "[swu] IKE responder: duplicate request msgid=%d, resending cached response (side effects not re-run)\n", header.MessageID)
+		}
+		if send != nil {
+			_ = send(cached)
 		}
 		return true
 	}
@@ -267,5 +295,24 @@ func (r *IKEResponder) sendResponse(send func([]byte) error, messageID uint32, i
 	if err != nil {
 		return err
 	}
+	r.cacheResponse(messageID, raw)
 	return send(raw)
+}
+
+// cacheResponse 记录 (INFORMATIONAL, msgid) → 响应字节，容量 responderDedupCapacity
+// 先进先出淘汰（对齐 Python 参考 _cache_response 的 order 列表）。
+func (r *IKEResponder) cacheResponse(messageID uint32, raw []byte) {
+	if r.dedupCache == nil {
+		r.dedupCache = make(map[dedupKey][]byte)
+	}
+	key := dedupKey{exchange: ikev2.ExchangeINFORMATIONAL, msgID: messageID}
+	if _, exists := r.dedupCache[key]; !exists {
+		r.dedupKeys = append(r.dedupKeys, key)
+		for len(r.dedupKeys) > responderDedupCapacity {
+			old := r.dedupKeys[0]
+			r.dedupKeys = r.dedupKeys[1:]
+			delete(r.dedupCache, old)
+		}
+	}
+	r.dedupCache[key] = append([]byte(nil), raw...)
 }

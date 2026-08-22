@@ -267,7 +267,7 @@ func (m *IKEPacketTunnelManager) EstablishTunnel(ctx context.Context, cfg Tunnel
 		return nil, err
 	}
 	result := tunnelResultFromIKE(cfg, epdg, init, child)
-	closeHandler, mobikeHandler, livenessHandler := m.controlHandlers(transport, init, auth, child, result, transportCfg)
+	closeHandler, mobikeHandler, livenessHandler, rekeyHandler := m.controlHandlers(transport, init, auth, child, result, transportCfg)
 	// 应答方：ePDG 主动的 INFORMATIONAL（DPD/DELETE/DEVICE_IDENTITY）经
 	// ESP 传输通道原路应答。send 回调绑定 espTransport 的发送路径
 	// （SOCKS5 版即原 relay/端口）；IMEI 来自隧道配置。
@@ -276,6 +276,20 @@ func (m *IKEPacketTunnelManager) EstablishTunnel(ctx context.Context, cfg Tunnel
 		responder = NewIKEResponder(init, init.Keys, strings.TrimSpace(cfg.IMEI), func(raw []byte) error {
 			return espTransport.SendESPPacket(context.Background(), raw)
 		})
+		if cfg.OnPSCFRestore != nil && result.PSCFAddress != "" {
+			// 只在新地址与当前不同时通知上层（重注册代价高，地址未变只是
+			// ePDG 重复确认）。当前地址为空说明 CFG 没协商到 P-CSCF（本环境
+			// 常态），任何下发地址都值得通知。
+			current := result.PSCFAddress
+			onRestore := cfg.OnPSCFRestore
+			responder.SetOnPSCFRestore(func(newPSCF string) {
+				if newPSCF == current {
+					return
+				}
+				current = newPSCF
+				onRestore(newPSCF)
+			})
+		}
 	}
 	sessionFactory := m.Config.PacketSessionFactory
 	if sessionFactory == nil {
@@ -292,6 +306,7 @@ func (m *IKEPacketTunnelManager) EstablishTunnel(ctx context.Context, cfg Tunnel
 		CloseHandler:    closeHandler,
 		LivenessHandler: livenessHandler,
 		IKEResponder:    responder,
+		RekeyHandler:    rekeyHandler,
 	})
 	if err != nil {
 		if closer, ok := espTransport.(ESPPacketTransportCloser); ok {
@@ -642,9 +657,9 @@ func (m *IKEPacketTunnelManager) childSPI(random io.Reader) ([]byte, error) {
 	return spi, nil
 }
 
-func (m *IKEPacketTunnelManager) controlHandlers(transport ikev2.InitTransport, init ikev2.InitResult, auth ikev2.FullAuthResult, child ikev2.ChildSAResult, result TunnelResult, transportCfg IKETransportConfig) (func(context.Context) error, func(context.Context, MOBIKERequest) (MOBIKEResult, error), func(context.Context) error) {
+func (m *IKEPacketTunnelManager) controlHandlers(transport ikev2.InitTransport, init ikev2.InitResult, auth ikev2.FullAuthResult, child ikev2.ChildSAResult, result TunnelResult, transportCfg IKETransportConfig) (func(context.Context) error, func(context.Context, MOBIKERequest) (MOBIKEResult, error), func(context.Context) error, func(context.Context) (ikev2.ChildSAResult, error)) {
 	if m.Config.DisableControlPlaneHooks || auth.NextMessageID == 0 || !ikeKeysUsable(init.Keys) {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 	control := &ikePacketTunnelControl{
 		transport:             transport,
@@ -663,11 +678,47 @@ func (m *IKEPacketTunnelManager) controlHandlers(transport ikev2.InitTransport, 
 	}
 	closeHandler := control.close
 	livenessHandler := control.liveness
+	rekeyHandler := control.rekeyChildSA
 	var mobikeHandler func(context.Context, MOBIKERequest) (MOBIKEResult, error)
 	if init.MOBIKESupported {
 		mobikeHandler = control.mobike
 	}
-	return closeHandler, mobikeHandler, livenessHandler
+	return closeHandler, mobikeHandler, livenessHandler, rekeyHandler
+}
+
+// rekeyChildSA 用 CREATE_CHILD_SA（N(REKEY_SA)）周期刷新 ESP SA（对齐 Python
+// 参考 _rekey_tick）。成功后 control 侧的 child/nextMessageID 同步前移，
+// 供后续 close() 删新 SA；ApplyChildSA 在 session 侧热切换加解密状态。
+func (c *ikePacketTunnelControl) rekeyChildSA(ctx context.Context) (ikev2.ChildSAResult, error) {
+	if c == nil {
+		return ikev2.ChildSAResult{}, ErrInvalidIKEControl
+	}
+	c.mu.Lock()
+	messageID := c.nextMessageID
+	c.nextMessageID++
+	c.mu.Unlock()
+	c.mu.Lock()
+	child := c.child
+	c.mu.Unlock()
+	res, err := ikev2.RunCREATE_CHILD_SA(ctx, ikev2.CreateChildSAConfig{
+		Transport: c.transport,
+		Init:      c.init,
+		Keys:      c.keys,
+		MessageID: messageID,
+		ChildSA:   child.SelectedSA,
+		ChildSPI:  child.LocalSPI,
+		TSi:       child.TSi,
+		TSr:       child.TSr,
+		RekeySPI:  child.RemoteSPI,
+		Random:    c.random,
+	})
+	if err != nil {
+		return ikev2.ChildSAResult{}, err
+	}
+	c.mu.Lock()
+	c.child = res.ChildSA
+	c.mu.Unlock()
+	return res.ChildSA, nil
 }
 
 type ikePacketTunnelControl struct {

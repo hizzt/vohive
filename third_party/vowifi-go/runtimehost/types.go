@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -282,6 +283,7 @@ type Instance struct {
 	voiceConfig  runtimeVoiceAgentConfig
 	imsClose     func(context.Context) error
 	imsRecover   func(context.Context) (IMSRegistrationResult, error)
+	stopCh       chan struct{} // Stop 时关闭一次, 后台 goroutine (P-CSCF 重注册等) 据此退出
 	stopped      bool
 }
 
@@ -319,6 +321,8 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 	var tunnel swu.TunnelSession
 	var tunnelResult swu.TunnelResult
 	var tunnelReady bool
+	// P-CSCF restoration 触发的待重注册地址（带缓冲=1：合并多次通知，最新地址生效）。
+	pscfRestoreCh := make(chan string, 1)
 	tunnelManager, err := tunnelManagerForStart(req)
 	if err != nil {
 		return nil, err
@@ -341,6 +345,18 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 		if !tunnelReady {
 			_ = session.Close(ctx)
 			return nil, fmt.Errorf("SWU tunnel establishment incomplete: %s", firstRuntimeNonEmpty(tunnelResult.Reason, "not ready"))
+		}
+		if notifier, ok := tunnel.(swu.PSCFRestoreNotifier); ok && req.IMSRegistrar != nil {
+			// P-CSCF restoration（TS 24.302 7.2.3.2）：ePDG 经 CFG_REQUEST 下发
+			// 新 P-CSCF 时重做 IMS 注册（re-REGISTER 才会用新地址）。回调只投
+			// 递到带缓冲 channel——执行需要 instance（此刻还没建好），由下方
+			// 启动的 goroutine 消费；重注册失败不拆隧道（旧注册仍可用）。
+			notifier.SetOnPSCFRestore(func(newPSCF string) {
+				select {
+				case pscfRestoreCh <- newPSCF:
+				default: // 丢弃旧地址, 未消费的槽位换新地址
+				}
+			})
 		}
 	}
 	imsReady := req.IMSRegistrar == nil
@@ -406,15 +422,56 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 		voiceConfig: voiceConfig,
 		imsClose:    imsResult.Close,
 		imsRecover:  imsResult.Recover,
+		stopCh:      make(chan struct{}),
 	}
 	svc.SetSMSTransport(inst.wrapSMSTransport(smsTransport))
 	svc.SetUSSDTransport(inst.wrapUSSDTransport(ussdTransport))
 	if req.VoiceGateway != nil {
 		req.VoiceGateway.RegisterAgent(req.DeviceID, inst)
 	}
+	inst.watchPSCFRestore(ctx, pscfRestoreCh)
 	inst.watchTunnelPump()
 	inst.notify(ctx)
 	return inst, nil
+}
+
+// watchPSCFRestore 消费 P-CSCF restoration 通知：ePDG 下发新 P-CSCF 地址时
+// 重做 IMS 注册。保守策略——重注册失败不拆隧道不置错误态（旧注册继续用，
+// 上层既有失败恢复路径兜底），实例停止即退出。
+func (i *Instance) watchPSCFRestore(ctx context.Context, ch <-chan string) {
+	if i == nil || ch == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	stopped := i.stopCh
+	if stopped == nil {
+		return
+	}
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-stopped:
+				return
+			case newPSCF := <-ch:
+				i.mu.RLock()
+				dead := i.stopped
+				i.mu.RUnlock()
+				if dead {
+					return
+				}
+				if os.Getenv("SWU_DEBUG_IKE") != "" {
+					fmt.Fprintf(os.Stderr, "[swu] P-CSCF restoration: re-registering IMS with %s\n", newPSCF)
+				}
+				// recoverIMSRegistration 复用既有恢复路径（重新 REGISTER +
+				// 换绑 voice agent）；失败只记录，不拆隧道。
+				_, _, _ = i.recoverIMSRegistration(ctx, "P-CSCF restoration "+newPSCF, true)
+			}
+		}
+	}()
 }
 
 // watchTunnelPump 监督 TUN packet pump：pump 任一方向读/写出错退出即数据面
@@ -568,6 +625,9 @@ func (i *Instance) Stop(ctx context.Context) error {
 	imsClose := i.imsClose
 	i.tunnel = nil
 	i.imsClose = nil
+	if !i.stopped && i.stopCh != nil {
+		close(i.stopCh)
+	}
 	i.stopped = true
 	i.state.Phase = PhaseStopped
 	i.state.TunnelReady = false

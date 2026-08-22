@@ -53,6 +53,11 @@ type TunnelConfig struct {
 	Identity       IMSIdentity
 	Proxy          *ProxyConfig
 	StartedAt      time.Time
+	// OnPSCFRestore 在 ePDG P-CSCF restoration（TS 24.302 7.2.3.2 CFG_REQUEST
+	// 下发新 P-CSCF 地址）时触发，参数为新地址。nil = 应答 CFG_REPLY 但不通知
+	// 上层（重注册由上层既有失败恢复路径兜底）。回调在独立 goroutine 执行，
+	// 不得阻塞；上层用它触发 IMS 重注册（新 P-CSCF 生效需 re-REGISTER）。
+	OnPSCFRestore func(newPSCF string)
 }
 
 func (c TunnelConfig) NormalizedMode() string {
@@ -143,6 +148,12 @@ type TunnelSession interface {
 	Result() TunnelResult
 	MOBIKE(context.Context, MOBIKERequest) (MOBIKEResult, error)
 	Close(context.Context) error
+}
+
+// PSCFRestoreNotifier 是可选能力接口：TunnelSession 实现它即可接收
+// ePDG P-CSCF restoration 通知（新 P-CSCF 地址）。
+type PSCFRestoreNotifier interface {
+	SetOnPSCFRestore(fn func(newPSCF string))
 }
 
 type TunnelManager interface {

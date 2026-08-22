@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -408,4 +409,44 @@ func TestIKEResponderAnswersIMEISVRequest(t *testing.T) {
 		return
 	}
 	t.Fatalf("response missing DEVICE_IDENTITY notify")
+}
+
+func TestIKEResponderDedupsRetransmittedRequests(t *testing.T) {
+	init, keys := responderFixture(t)
+	var sent [][]byte
+	r := NewIKEResponder(init, keys, "123456789012345", func(raw []byte) error {
+		sent = append(sent, append([]byte(nil), raw...))
+		return nil
+	})
+	var deleteCalls int32
+	r.SetOnDelete(func() { atomic.AddInt32(&deleteCalls, 1) })
+	delPayload, err := ikev2.ESPDeletePayload([]byte{0x22, 0x33, 0x44, 0x55})
+	if err != nil {
+		t.Fatalf("ESPDeletePayload() error = %v", err)
+	}
+	req := buildPeerRequest(t, init, keys, 7, []ikev2.Payload{delPayload}, false)
+	if !r.HandleInbound(context.Background(), req) {
+		t.Fatal("first request not consumed")
+	}
+	// 副作用异步触发，等待其完成再发重传。
+	deadline := time.Now().Add(time.Second)
+	for atomic.LoadInt32(&deleteCalls) == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if atomic.LoadInt32(&deleteCalls) != 1 {
+		t.Fatalf("delete callbacks=%d, want 1", deleteCalls)
+	}
+	// ePDG 重传同一 msgid 请求：应答从缓存重发（字节相同），副作用不再执行。
+	if !r.HandleInbound(context.Background(), req) {
+		t.Fatal("retransmitted request not consumed")
+	}
+	if atomic.LoadInt32(&deleteCalls) != 1 {
+		t.Fatalf("delete callbacks after retransmit=%d, want 1 (side effects must not re-run)", deleteCalls)
+	}
+	if len(sent) != 2 {
+		t.Fatalf("responses=%d, want 2 (original + cached resend)", len(sent))
+	}
+	if string(sent[0]) != string(sent[1]) {
+		t.Fatal("retransmit must resend identical cached response bytes")
+	}
 }

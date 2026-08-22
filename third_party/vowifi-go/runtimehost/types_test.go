@@ -2,6 +2,7 @@ package runtimehost
 
 import (
 	"context"
+	"sync/atomic"
 	"encoding/hex"
 	"errors"
 	"strconv"
@@ -35,17 +36,24 @@ func (testModem) TransmitAPDU(channel int, hexAPDU string) (string, error) {
 }
 
 type testIMSRegistrar struct {
-	result IMSRegistrationResult
-	err    error
-	config IMSRegistrationConfig
+	result  IMSRegistrationResult
+	err     error
+	config  IMSRegistrationConfig
+	calls   int
+	recover func(context.Context) (IMSRegistrationResult, error)
 }
 
 func (r *testIMSRegistrar) RegisterIMS(ctx context.Context, cfg IMSRegistrationConfig) (IMSRegistrationResult, error) {
+	r.calls++
 	r.config = cfg
 	if r.err != nil {
 		return IMSRegistrationResult{}, r.err
 	}
-	return r.result, nil
+	res := r.result
+	if r.recover != nil {
+		res.Recover = r.recover
+	}
+	return res, nil
 }
 
 func TestStartUsesIMSRegistrarResult(t *testing.T) {
@@ -1094,11 +1102,16 @@ type runtimeTunnelSession struct {
 	mobikeResult  swu.MOBIKEResult
 	mobikeErr     error
 	mobikeRequest swu.MOBIKERequest
+	pscfFn        func(newPSCF string)
 	closed        bool
 }
 
 func (s *runtimeTunnelSession) Result() swu.TunnelResult {
 	return s.result
+}
+
+func (s *runtimeTunnelSession) SetOnPSCFRestore(fn func(newPSCF string)) {
+	s.pscfFn = fn
 }
 
 func (s *runtimeTunnelSession) MOBIKE(ctx context.Context, req swu.MOBIKERequest) (swu.MOBIKEResult, error) {
@@ -1204,4 +1217,47 @@ func (t *runtimeUSSDTransport) HandleIMSBye(ctx context.Context, req messaging.I
 func (t *runtimeSMSTransport) SendSMSPart(ctx context.Context, req messaging.SMSSendRequest) (messaging.SMSSendResult, error) {
 	t.requests = append(t.requests, req)
 	return messaging.SMSSendResult{State: "sent"}, nil
+}
+
+func TestStartReRegisterIMSOnPSCFRestore(t *testing.T) {
+	manager := &runtimeTunnelManager{session: &runtimeTunnelSession{result: swu.TunnelResult{
+		Ready:            true,
+		Mode:             swu.DataplaneModeUserspace,
+		EPDGAddress:      "epdg.example",
+		IKEEstablished:   true,
+		IPsecEstablished: true,
+		PSCFAddress:      "10.11.12.13",
+	}}}
+	registrar := &testIMSRegistrar{result: IMSRegistrationResult{Registered: true, StatusCode: 200, Reason: "ims registered"}}
+	var recoverCalls int32
+	registrar.recover = func(ctx context.Context) (IMSRegistrationResult, error) {
+		atomic.AddInt32(&recoverCalls, 1)
+		return IMSRegistrationResult{Registered: true, StatusCode: 200, Reason: "re-registered"}, nil
+	}
+	inst, err := Start(context.Background(), StartRequest{
+		DeviceID:      "dev-1",
+		Profile:       identity.Profile{IMSI: "310280233641503", MCC: "310", MNC: "280"},
+		Dataplane:     DataplanePolicy{Mode: swu.DataplaneModeUserspace},
+		TunnelManager: manager,
+		IMSRegistrar:  registrar,
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	defer inst.Stop(context.Background())
+	session := manager.session
+	if session.pscfFn == nil {
+		t.Fatal("P-CSCF restore callback not registered on tunnel session")
+	}
+	session.pscfFn("10.99.88.77")
+	deadline := time.Now().Add(2 * time.Second)
+	for atomic.LoadInt32(&recoverCalls) == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if atomic.LoadInt32(&recoverCalls) == 0 {
+		t.Fatal("P-CSCF restoration did not trigger IMS re-registration")
+	}
+	if registrar.calls != 1 {
+		t.Fatalf("initial RegisterIMS calls=%d, want 1 (recovery path uses Recover, not RegisterIMS)", registrar.calls)
+	}
 }

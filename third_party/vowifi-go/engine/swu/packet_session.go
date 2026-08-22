@@ -102,6 +102,24 @@ type PacketSessionConfig struct {
 	// ePDG 在空闲 ~40s 后拆 SA）。设置后 ReadInnerPacket 对入站 IKE 报文
 	// 先经应答方分发，同时刷新 lastInbound（对端有控制流量即存活）。
 	IKEResponder *IKEResponder
+	// RekeyHandler 周期执行 CHILD_SA rekey（CREATE_CHILD_SA + N(REKEY_SA)）。
+	// 设置后 StartRekeyLoop 每 30min 换新 ESP SA（PFS 刷新，防对端 SA 到期/
+	// 序列号上限静默失效）；失败保留旧 SA 下轮重试。nil = 不 rekey。
+	RekeyHandler func(ctx context.Context) (ikev2.ChildSAResult, error)
+}
+
+// SetOnPSCFRestore 注册 P-CSCF restoration 回调（转发给 IKE 应答方）。
+// 上层（runtimehost）用它触发 IMS 重注册。幂等：后注册覆盖前者。
+func (s *PacketSession) SetOnPSCFRestore(fn func(newPSCF string)) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	responder := s.ikeResponder
+	s.mu.Unlock()
+	if responder != nil {
+		responder.SetOnPSCFRestore(fn)
+	}
 }
 
 // livenessProbeInterval 是 DPD 探测间隔；livenessProbeTimeout 是单次探测超时。
@@ -127,9 +145,12 @@ type PacketSession struct {
 	mobikeHandler   func(context.Context, MOBIKERequest) (MOBIKEResult, error)
 	closeHandler    func(context.Context) error
 	livenessHandler func(context.Context) error
+	rekeyHandler    func(ctx context.Context) (ikev2.ChildSAResult, error)
 	ikeResponder    *IKEResponder
 	lastInbound     time.Time // 最近一次收到对端下行流量/keepalive 的时间（有流量跳过 DPD）
 	livenessCancel  context.CancelFunc
+	rekeyCancel     context.CancelFunc
+	child           ikev2.ChildSAResult // 当前 CHILD_SA（rekey 后更新）
 	stats           PacketTunnelStats
 	closed          bool
 }
@@ -166,11 +187,13 @@ func NewPacketSession(cfg PacketSessionConfig) (*PacketSession, error) {
 		result:          result,
 		outbound:        outbound,
 		inbound:         inbound,
+		child:           cfg.ChildSA,
 		transport:       cfg.Transport,
 		random:          cfg.Random,
 		mobikeHandler:   cfg.MOBIKEHandler,
 		closeHandler:    cfg.CloseHandler,
 		livenessHandler: cfg.LivenessHandler,
+		rekeyHandler:    cfg.RekeyHandler,
 		ikeResponder:    cfg.IKEResponder,
 		lastInbound:     time.Now(),
 	}, nil
@@ -479,6 +502,10 @@ func (s *PacketSession) Close(ctx context.Context) error {
 	if s.livenessCancel != nil {
 		s.livenessCancel()
 		s.livenessCancel = nil
+	}
+	if s.rekeyCancel != nil {
+		s.rekeyCancel()
+		s.rekeyCancel = nil
 	}
 	s.mu.Unlock()
 	if responder != nil {
