@@ -21,8 +21,9 @@ func TestIKEPacketTunnelManagerEstablishesPacketSession(t *testing.T) {
 	var gotESPTransport ESPTransportConfig
 
 	manager := NewIKEPacketTunnelManager(IKEPacketTunnelManagerConfig{
-		SIM:    ikeTunnelAKAProvider{},
-		Random: bytes.NewReader(append([]byte{0xca, 0xfe, 0xba, 0xbe}, bytes.Repeat([]byte{0x55}, 64)...)),
+		SIM:          ikeTunnelAKAProvider{},
+		EPDGResolver: newEPDGTestResolver("epdg.example", "198.18.0.38"),
+		Random:       bytes.NewReader(append([]byte{0xca, 0xfe, 0xba, 0xbe}, bytes.Repeat([]byte{0x55}, 64)...)),
 		IKETransportFactory: func(cfg TunnelConfig, transport IKETransportConfig) (ikev2.InitTransport, error) {
 			gotIKETransport = transport
 			return ikeTransport, nil
@@ -78,19 +79,21 @@ func TestIKEPacketTunnelManagerEstablishesPacketSession(t *testing.T) {
 	if !result.MOBIKESupported || result.ChildSAIdentifier != "cafebabe/22222222" {
 		t.Fatalf("result MOBIKE/child id = %+v", result)
 	}
-if gotIKETransport.RemoteAddr != "198.18.0.38:500" || gotIKETransport.LocalAddr != "192.0.2.10:500" || gotIKETransport.UseNonESPMarker {
-			t.Fatalf("IKE transport=%+v", gotIKETransport)
-		}
-		if gotESPTransport.RemoteAddr != "198.18.0.38:500" || gotESPTransport.LocalAddr != "192.0.2.10:500" {
-			t.Fatalf("ESP transport=%+v", gotESPTransport)
-		}
-		if gotInit.Transport != ikeTransport || gotInit.RemotePort != 500 {
+	if gotIKETransport.RemoteAddr != "198.18.0.38:500" || gotIKETransport.LocalAddr != "192.0.2.10:500" || gotIKETransport.UseNonESPMarker {
+		t.Fatalf("IKE transport=%+v", gotIKETransport)
+	}
+	if gotESPTransport.RemoteAddr != "198.18.0.38:500" || gotESPTransport.LocalAddr != "192.0.2.10:500" {
+		t.Fatalf("ESP transport=%+v", gotESPTransport)
+	}
+	if gotInit.Transport != ikeTransport || gotInit.RemotePort != 500 {
 		t.Fatalf("init config=%+v", gotInit)
 	}
 	if gotAuth.Transport != ikeTransport || gotAuth.SIM == nil {
 		t.Fatalf("auth config transport/SIM not wired: %+v", gotAuth)
 	}
-	if gotAuth.EAPIdentity != "310280233641503@private.att.net" {
+	// 新语义（对齐 vowifi_gateway）：EAP 身份永远用 IMSI 永久 NAI，
+	// ISIM/IMPI 的 ims./私有域身份不进 IKE/EAP。
+	if gotAuth.EAPIdentity != "0310280233641503@nai.epc.mnc280.mcc310.3gppnetwork.org" {
 		t.Fatalf("EAP identity=%q", gotAuth.EAPIdentity)
 	}
 	if gotAuth.InitiatorID.Type != ikev2.IDRFC822Addr || string(gotAuth.InitiatorID.Data) != gotAuth.EAPIdentity {
@@ -122,8 +125,9 @@ func TestIKEPacketTunnelManagerDerivesEPDGAndAKAIdentity(t *testing.T) {
 	var gotAuth ikev2.FullAuthConfig
 	var gotIKETransport IKETransportConfig
 	manager := NewIKEPacketTunnelManager(IKEPacketTunnelManagerConfig{
-		SIM:      ikeTunnelAKAProvider{},
-		ChildSPI: []byte{0x11, 0x22, 0x33, 0x44},
+		SIM:          ikeTunnelAKAProvider{},
+		ChildSPI:     []byte{0x11, 0x22, 0x33, 0x44},
+		EPDGResolver: newEPDGTestResolver("epdg.epc.mnc028.mcc310.pub.3gppnetwork.org", "192.0.2.99"),
 		IKETransportFactory: func(cfg TunnelConfig, transport IKETransportConfig) (ikev2.InitTransport, error) {
 			gotIKETransport = transport
 			return ikeTunnelNoopTransport{}, nil
@@ -154,10 +158,10 @@ func TestIKEPacketTunnelManagerDerivesEPDGAndAKAIdentity(t *testing.T) {
 
 	wantEPDG := "epdg.epc.mnc028.mcc310.pub.3gppnetwork.org"
 	wantIdentity := "0310280233641503@nai.epc.mnc028.mcc310.3gppnetwork.org"
-if gotIKETransport.EPDGAddress != "127.0.0.1" || gotIKETransport.RemoteAddr != "127.0.0.1:500" {
-			t.Fatalf("IKE transport=%+v", gotIKETransport)
-		}
-		if gotAuth.EAPIdentity != wantIdentity || string(gotAuth.InitiatorID.Data) != wantIdentity {
+	if gotIKETransport.EPDGAddress != "192.0.2.99" || gotIKETransport.RemoteAddr != "192.0.2.99:500" {
+		t.Fatalf("IKE transport=%+v", gotIKETransport)
+	}
+	if gotAuth.EAPIdentity != wantIdentity || string(gotAuth.InitiatorID.Data) != wantIdentity {
 		t.Fatalf("auth identity=%q initiator=%q", gotAuth.EAPIdentity, gotAuth.InitiatorID.Data)
 	}
 	if session.Result().EPDGAddress != wantEPDG {
@@ -499,5 +503,16 @@ func TestFilterProposalsByDHGroup(t *testing.T) {
 	g2 := filterProposalsByDHGroup(sa, ikev2.DHGroup1024BitMODP)
 	if len(g2.Proposals) != 3 {
 		t.Fatalf("MODP1024 filtered count=%d, want 3", len(g2.Proposals))
+	}
+	// RFC 7296 §3.3：提案编号必须从 1 连续——过滤后重编号，不能保留原始 2,3,4。
+	for i, p := range g2.Proposals {
+		if p.Number != uint8(i+1) {
+			t.Fatalf("MODP1024 proposal[%d].Number=%d want %d", i, p.Number, i+1)
+		}
+	}
+	for i, p := range g14.Proposals {
+		if p.Number != uint8(i+1) {
+			t.Fatalf("MODP2048 proposal[%d].Number=%d want %d", i, p.Number, i+1)
+		}
 	}
 }

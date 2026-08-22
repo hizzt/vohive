@@ -103,12 +103,15 @@ func TestVodafoneProfileUsesV155(t *testing.T) {
 	if !cfg.IKE.EffectiveRetryOnTimeout() {
 		t.Fatalf("Vodafone should retry on timeout")
 	}
-	// A 方案（保守回归）：Vodafone 固定走 500，不切 4500，SOCKS 不保活
-	if cfg.Transport.EffectivePrefer4500OnNATOnly() {
-		t.Fatalf("A scheme: Vodafone should NOT prefer 4500 on NAT (expect false)")
+	// NAT-T 必须（ike_success2.pcap 实证）：SOCKS5 场景 NAT_DST 必不匹配，
+	// 检出 NAT 后必须切 4500+marker，否则 ePDG 对 IKE_AUTH 静默丢弃。
+	if !cfg.Transport.EffectivePrefer4500OnNATOnly() {
+		t.Fatalf("Vodafone should prefer 4500 on NAT (expect true)")
 	}
-	if cfg.Transport.EffectiveKeepSOCKSControlAlive() {
-		t.Fatalf("A scheme: Vodafone should NOT keep SOCKS control alive (expect false)")
+	// SOCKS5 UDP relay 生命周期绑定 TCP 控制连接：不保活 TCP 伦敦代理会在
+	// 数十秒后回收 relay（设备实测会话静默死亡），必须保活。
+	if !cfg.Transport.EffectiveKeepSOCKSControlAlive() {
+		t.Fatalf("Vodafone should keep SOCKS control alive (expect true)")
 	}
 }
 

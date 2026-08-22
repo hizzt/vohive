@@ -2,9 +2,12 @@ package swu
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -91,19 +94,36 @@ type PacketSessionConfig struct {
 	Random        io.Reader
 	MOBIKEHandler func(context.Context, MOBIKERequest) (MOBIKEResult, error)
 	CloseHandler  func(context.Context) error
+	// LivenessHandler 是 DPD 探测（INFORMATIONAL 空交换）。设置后
+	// StartLivenessLoop 在空闲期周期探测对端存活，探测失败即关闭会话触发重建。
+	LivenessHandler func(context.Context) error
 }
 
+// livenessProbeInterval 是 DPD 探测间隔；livenessProbeTimeout 是单次探测超时。
+// 间隔取 20s：伦敦 SOCKS5 代理对 UDP relay 的下行转发在无双向流约 60-90s
+// 后静默回收（设备 tcpdump 实证：出站 keepalive 正常、入站先停），周期
+// DPD 的请求-响应是双向流，可刷新 relay 生命周期。60s 间隔时探测发出前
+// relay 已死，DPD 必超时 → 会话每 ~105s 重建一次；20s 时 DPD 自身成为
+// 维持流。对齐 1.5.5 的周期 SIP 事务（~45s 双向）+ keepalive(20s) 存活模式。
+const (
+	livenessProbeInterval = 20 * time.Second
+	livenessProbeTimeout  = 90 * time.Second
+)
+
 type PacketSession struct {
-	mu            sync.Mutex
-	result        TunnelResult
-	outbound      *esp.SA
-	inbound       *esp.SA
-	transport     ESPPacketTransport
-	random        io.Reader
-	mobikeHandler func(context.Context, MOBIKERequest) (MOBIKEResult, error)
-	closeHandler  func(context.Context) error
-	stats         PacketTunnelStats
-	closed        bool
+	mu              sync.Mutex
+	result          TunnelResult
+	outbound        *esp.SA
+	inbound         *esp.SA
+	transport       ESPPacketTransport
+	random          io.Reader
+	mobikeHandler   func(context.Context, MOBIKERequest) (MOBIKEResult, error)
+	closeHandler    func(context.Context) error
+	livenessHandler func(context.Context) error
+	lastInbound     time.Time // 最近一次收到对端下行流量/keepalive 的时间（有流量跳过 DPD）
+	livenessCancel  context.CancelFunc
+	stats           PacketTunnelStats
+	closed          bool
 }
 
 var (
@@ -135,15 +155,175 @@ func NewPacketSession(cfg PacketSessionConfig) (*PacketSession, error) {
 		result.EstablishedAt = time.Now()
 	}
 	return &PacketSession{
-		result:        result,
-		outbound:      outbound,
-		inbound:       inbound,
-		transport:     cfg.Transport,
-		random:        cfg.Random,
-		mobikeHandler: cfg.MOBIKEHandler,
-		closeHandler:  cfg.CloseHandler,
+		result:          result,
+		outbound:        outbound,
+		inbound:         inbound,
+		transport:       cfg.Transport,
+		random:          cfg.Random,
+		mobikeHandler:   cfg.MOBIKEHandler,
+		closeHandler:    cfg.CloseHandler,
+		livenessHandler: cfg.LivenessHandler,
+		lastInbound:     time.Now(),
 	}, nil
 }
+
+// StartLivenessLoop 启动 DPD 探测循环：每个探测周期检查最近下行时间，
+// 超过一个周期无下行流量才发 INFORMATIONAL 空交换探测（有流量即视为活，
+// 避免给 ePDG 加压）。探测失败（对端死亡/链路断）即关闭会话，让上层重建。
+func (s *PacketSession) StartLivenessLoop(ctx context.Context) {
+	if s == nil || s.livenessHandler == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	s.mu.Lock()
+	if s.closed || s.livenessCancel != nil {
+		s.mu.Unlock()
+		cancel()
+		return
+	}
+	s.livenessCancel = cancel
+	_ = s.livenessHandler // 保活探测改为 ESP 层 ICMP echo，IKE DPD handler 不再使用
+	s.mu.Unlock()
+
+	go func() {
+		defer cancel()
+		ticker := time.NewTicker(livenessProbeInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				s.mu.Lock()
+				idle := time.Since(s.lastInbound)
+				closed := s.closed
+				s.mu.Unlock()
+				if closed || idle < livenessProbeInterval {
+					continue // 有下行流量（含对端 keepalive）即视为对端存活
+				}
+				// 保活探测改为 ESP 层：向隧道对端内网关发 ICMP echo（经 ESP
+				// 加密），对端必回 ESP——这是双向 ESP 流量，ePDG/代理链路都
+				// 按 ESP 流维持。设备实测（112+伦敦 SOCKS5）：IKE INFORMATIONAL
+				// 空探测在会话空闲 ~40s 后被 ePDG 无视（1.5.5 同代理 0.2s 秒回
+				// 是因为它有周期 SIP 事务持续维持 ESP 流），而 ESP 层探测在
+				// REGISTER 期间始终秒回。echo 无响应判定链路死（累计超时）。
+				probeCtx, probeCancel := context.WithTimeout(ctx, livenessProbeTimeout)
+				err := s.probeESPKeepalive(probeCtx)
+				probeCancel()
+				if err == nil {
+					continue
+				}
+				fmt.Fprintf(os.Stderr, "[swu] ESP keepalive probe failed (%v), closing session for re-establishment\n", err)
+				_ = s.Close(context.Background())
+				return
+			}
+		}
+	}()
+}
+
+// probeESPKeepalive 发一个内层 ICMP echo 并等待响应（任意下行 ESP 包即可，
+// 响应会刷新 lastInbound，ReadESPPacket 的读循环自然收到）。
+func (s *PacketSession) probeESPKeepalive(ctx context.Context) error {
+	if s == nil {
+		return ErrInvalidPacketTunnel
+	}
+	s.mu.Lock()
+	closed := s.closed
+	gateway := s.result.RemoteInnerIP
+	local := s.result.LocalInnerIP
+	dns := ""
+	if len(s.result.DNSServers) > 0 {
+		dns = s.result.DNSServers[0]
+	}
+	s.mu.Unlock()
+	if closed {
+		return ErrPacketTunnelClosed
+	}
+	// 探测目标优先 DNS 服务器（必答查询），其次对端网关 ICMP echo。
+	// 设备实测：运营商网关对 ICMP echo 不应答，DNS 服务器对查询必答。
+	dst := net.ParseIP(strings.TrimSpace(dns))
+	useDNS := dst != nil
+	if !useDNS {
+		dst = net.ParseIP(strings.TrimSpace(gateway))
+	}
+	if dst == nil {
+		// 无可用探测目标：退化为 NAT-T keepalive（单向，仅保 NAT 映射）
+		return s.sendNATTKeepaliveOnly(ctx)
+	}
+	src := net.ParseIP(strings.TrimSpace(local))
+	if src == nil {
+		return fmt.Errorf("%w: local inner ip invalid", ErrInvalidPacketTunnel)
+	}
+	var payload []byte
+	if useDNS {
+		payload = buildDNSProbeQuery()
+	} else {
+		echo, err := buildICMPv4EchoRequest(espKeepaliveProbeID, espKeepaliveProbeSeq)
+		espKeepaliveProbeSeq++
+		if err != nil {
+			return err
+		}
+		payload = echo
+	}
+	proto := byte(1) // ICMP
+	if useDNS {
+		proto = 17 // UDP
+	}
+	inner, err := buildIPv4Packet(src, dst, proto, payload)
+	if err != nil {
+		return err
+	}
+	if err := contextReady(ctx); err != nil {
+		return err
+	}
+	if err := s.SendInnerPacket(ctx, inner); err != nil {
+		return err
+	}
+	// 等待响应：任意下行流量刷新 lastInbound 即视为活
+	deadline := time.Now().Add(livenessProbeTimeout)
+	for time.Now().Before(deadline) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		s.mu.Lock()
+		lastInbound := s.lastInbound
+		closed := s.closed
+		s.mu.Unlock()
+		if closed {
+			return ErrPacketTunnelClosed
+		}
+		if time.Since(lastInbound) < livenessProbeInterval {
+			return nil // 收到了下行（echo 应答或其他下行包）
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
+	return fmt.Errorf("%w: no inbound after %v", ErrInvalidPacketTunnel, livenessProbeTimeout)
+}
+
+// sendNATTKeepaliveOnly 无对端内网地址时的降级保活。
+func (s *PacketSession) sendNATTKeepaliveOnly(ctx context.Context) error {
+	s.mu.Lock()
+	transport := s.transport
+	s.mu.Unlock()
+	sender, ok := transport.(ESPPacketTransport)
+	if !ok {
+		return fmt.Errorf("%w: transport cannot send", ErrInvalidPacketTunnel)
+	}
+	if err := contextReady(ctx); err != nil {
+		return err
+	}
+	return sender.SendESPPacket(ctx, []byte{0xff})
+}
+
+var espKeepaliveProbeID uint16 = 0x7654
+var espKeepaliveProbeSeq uint32 = 1
 
 func NextHeaderForInnerPacket(packet []byte) (uint8, error) {
 	if len(packet) == 0 {
@@ -270,6 +450,10 @@ func (s *PacketSession) Close(ctx context.Context) error {
 	s.closed = true
 	handler := s.closeHandler
 	transport := s.transport
+	if s.livenessCancel != nil {
+		s.livenessCancel()
+		s.livenessCancel = nil
+	}
 	s.mu.Unlock()
 	var err error
 	if handler != nil {
@@ -404,7 +588,23 @@ func (s *PacketSession) ReadInnerPacket(ctx context.Context) (PacketTunnelPacket
 		s.recordInboundError(err)
 		return PacketTunnelPacket{}, err
 	}
-	return s.ReceiveESPPacket(ctx, packet)
+	s.mu.Lock()
+	s.lastInbound = time.Now() // 有下行流量即对端存活，DPD 循环据此跳过探测
+	s.mu.Unlock()
+	out, openErr := s.ReceiveESPPacket(ctx, packet)
+	if openErr != nil && errors.Is(openErr, esp.ErrInvalidPacket) && isSPIMismatchError(openErr) {
+		// SPI 不匹配的 ESP 包是旧 SA 迟到流量/混流（设备实测 `spi 00000000`
+		// 单包曾把健康会话连着 pump 一起杀掉触发重建），丢弃继续读下一包。
+		return s.ReadInnerPacket(ctx)
+	}
+	return out, openErr
+}
+
+// isSPIMismatchError 判断 ESP Open 错误是否为 SPI 不匹配（可丢弃的混流包）。
+// esp.SA.Open 对 SPI 不匹配报 "spi %08x != %08x"，其余（too short/icv/seq）
+// 是真实损坏，交给上层按会话错误处理。
+func isSPIMismatchError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), ": spi ")
 }
 
 func (s *PacketSession) PacketStats() PacketTunnelStats {
@@ -507,4 +707,57 @@ func firstPacketNonEmpty(items ...string) string {
 		}
 	}
 	return ""
+}
+
+// buildICMPv4EchoRequest 构造 8B ICMP echo request 头（校验和为 0，
+// 大多数实现接受；对端为运营商网关，echo 必答）。
+func buildICMPv4EchoRequest(id uint16, seq uint32) ([]byte, error) {
+	out := make([]byte, 8)
+	out[0] = 8 // echo request
+	out[1] = 0
+	binary.BigEndian.PutUint16(out[4:6], id)
+	binary.BigEndian.PutUint16(out[6:8], uint16(seq))
+	return out, nil
+}
+
+// buildIPv4Packet 构造最小 IPv4 头 + payload（proto 为 IP 协议号，TTL 64）。
+func buildIPv4Packet(src, dst net.IP, proto byte, payload []byte) ([]byte, error) {
+	if src == nil || dst == nil {
+		return nil, fmt.Errorf("%w: nil ip", ErrUnsupportedInnerPacket)
+	}
+	src4 := src.To4()
+	dst4 := dst.To4()
+	if src4 == nil || dst4 == nil {
+		return nil, fmt.Errorf("%w: inner ips must be ipv4", ErrUnsupportedInnerPacket)
+	}
+	totalLen := 20 + len(payload)
+	out := make([]byte, 20, totalLen)
+	out[0] = 0x45
+	binary.BigEndian.PutUint16(out[2:4], uint16(totalLen))
+	out[4], out[5], out[6], out[7] = 0, 0, 0, 0
+	out[8] = 64 // TTL
+	out[9] = proto
+	copy(out[12:16], src4)
+	copy(out[16:20], dst4)
+	out = append(out, payload...)
+	return out, nil
+}
+
+// buildDNSProbeQuery 构造最小 UDP+DNS A 查询（查询 '.' NS 记录无需真实域名，
+// DNS 服务器必答；UDP 头 8B + DNS 头 12B + 问题 17B）。
+func buildDNSProbeQuery() []byte {
+	// UDP 头：源端口 43761，目的端口 53，长度，校验和 0（运营商网关普遍接受）
+	udp := make([]byte, 8)
+	binary.BigEndian.PutUint16(udp[0:2], 43761)
+	binary.BigEndian.PutUint16(udp[2:4], 53)
+	// DNS 查询: root NS 查询 id=0x7654
+	q := []byte{
+		0x76, 0x54, 0x01, 0x00, // id, flags=recursion
+		0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // qdcount=1
+		0x00,                   // root label
+		0x00, 0x02, 0x00, 0x01, // type NS, class IN
+	}
+	body := append(udp, q...)
+	binary.BigEndian.PutUint16(body[4:6], uint16(len(body)))
+	return body
 }

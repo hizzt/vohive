@@ -35,6 +35,14 @@ type CarrierTransportProfile struct {
 	RequestPCSCF            *bool `json:"request_pcscf,omitempty"`
 }
 
+// CarrierCPProfile 控制 IKE_AUTH CFG(CP) 请求的地址族策略（vowifi_gateway swu_ike.py
+// 的 cp_mode 家族）：v4/v6/dual 只请求对应属性；auto 按顺序探测直到拿到可用 PDN。
+// Vodafone UK（234-15）实测为 IPv4-only IMS，v6 请求会收私有 Notify 16375 拒绝。
+type CarrierCPProfile struct {
+	Mode  string   `json:"mode,omitempty"`   // auto | v4 | v6 | dual
+	Order []string `json:"order,omitempty"`  // auto 模式的探测顺序，默认 v4,dual,v6
+}
+
 type EffectiveCarrierConfig struct {
 	MCC       string                  `json:"mcc"`
 	MNC       string                  `json:"mnc"`
@@ -43,6 +51,7 @@ type EffectiveCarrierConfig struct {
 	IKE       CarrierIKEProfile       `json:"ike,omitempty"`
 	EAP       CarrierEAPProfile       `json:"eap,omitempty"`
 	Transport CarrierTransportProfile `json:"transport,omitempty"`
+	CP        CarrierCPProfile        `json:"cp,omitempty"`
 }
 
 type EffectiveCarrierConfigInput struct {
@@ -87,7 +96,7 @@ var builtinCarriers = map[string]EffectiveCarrierConfig{
 		},
 		Transport: CarrierTransportProfile{
 			Prefer4500OnNATOnly:   boolPtr(false),
-			KeepSOCKSControlAlive: boolPtr(false),
+			KeepSOCKSControlAlive: boolPtr(true),
 		},
 	},
 	"310410": {
@@ -113,7 +122,7 @@ var builtinCarriers = map[string]EffectiveCarrierConfig{
 		},
 		Transport: CarrierTransportProfile{
 			Prefer4500OnNATOnly:   boolPtr(false),
-			KeepSOCKSControlAlive: boolPtr(false),
+			KeepSOCKSControlAlive: boolPtr(true),
 		},
 	},
 	"234015": {
@@ -135,9 +144,18 @@ var builtinCarriers = map[string]EffectiveCarrierConfig{
 			NetworkName:    "WLAN",
 		},
 		Transport: CarrierTransportProfile{
-			Prefer4500OnNATOnly:   boolPtr(false),
-			KeepSOCKSControlAlive: boolPtr(false),
+			// NAT-T 必须：SOCKS5 代理场景 ePDG 看到的是代理出口（伦敦）IP 而非
+			// 本机 IP，NAT_DETECTION_DESTINATION_IP 必然不匹配（NAT 已检出）。
+			// ike_success2.pcap（08-20 15:12 成功握手）实证：IKE_AUTH 及后续全部
+			// 报文走 4500 + 4 字节 marker；留在 500 端口则 ePDG 对 IKE_AUTH 静默。
+			Prefer4500OnNATOnly:   boolPtr(true),
+			KeepSOCKSControlAlive: boolPtr(true),
 			RequestPCSCF:          boolPtr(false),
+		},
+		CP: CarrierCPProfile{
+			// Vodafone UK 实测（vowifi_gateway）：IPv4-only IMS PDN；
+			// v6-only 请求会收私有 Notify 16375 拒绝。
+			Mode: "v4",
 		},
 	},
 	"234030": {
@@ -159,8 +177,9 @@ var builtinCarriers = map[string]EffectiveCarrierConfig{
 			NetworkName:    "WLAN",
 		},
 		Transport: CarrierTransportProfile{
-			Prefer4500OnNATOnly:   boolPtr(false),
-			KeepSOCKSControlAlive: boolPtr(false),
+			// 同 234015：NAT-T 4500 切换是 Vodafone ePDG 过 IKE_AUTH 的必要条件。
+			Prefer4500OnNATOnly:   boolPtr(true),
+			KeepSOCKSControlAlive: boolPtr(true),
 		},
 	},
 }
@@ -284,6 +303,7 @@ func normalizeConfig(cfg EffectiveCarrierConfig) EffectiveCarrierConfig {
 	cfg.IKE = normalizeIKEProfile(cfg.IKE, cfg.MCC)
 	cfg.EAP = normalizeEAPProfile(cfg.EAP)
 	cfg.Transport = normalizeTransportProfile(cfg.Transport)
+	cfg.CP = normalizeCPProfile(cfg.CP)
 	return cfg
 }
 
@@ -340,7 +360,7 @@ func normalizeTransportProfile(p CarrierTransportProfile) CarrierTransportProfil
 		p.Prefer4500OnNATOnly = &v
 	}
 	if p.KeepSOCKSControlAlive == nil {
-		v := false
+		v := true
 		p.KeepSOCKSControlAlive = &v
 	}
 	if p.RequestPCSCF == nil {
@@ -356,6 +376,34 @@ func normalizeMNC(mnc string) string {
 		return "0" + mnc
 	}
 	return mnc
+}
+
+func normalizeCPProfile(p CarrierCPProfile) CarrierCPProfile {
+	p.Mode = strings.ToLower(strings.TrimSpace(p.Mode))
+	switch p.Mode {
+	case "v4", "v6", "dual":
+	case "":
+		p.Mode = "auto"
+	default:
+		p.Mode = "auto"
+	}
+	if len(p.Order) == 0 {
+		if p.Mode == "auto" {
+			// v4 优先：多数 ePDG 兼容 IPv4 CFG；v6-only 运营商靠探测轮到。
+			p.Order = []string{"v4", "dual", "v6"}
+		}
+	}
+	filtered := make([]string, 0, len(p.Order))
+	for _, item := range p.Order {
+		switch strings.ToLower(strings.TrimSpace(item)) {
+		case "v4", "v6", "dual":
+			filtered = append(filtered, strings.ToLower(strings.TrimSpace(item)))
+		}
+	}
+	if len(filtered) > 0 {
+		p.Order = filtered
+	}
+	return p
 }
 
 func presetKey(mcc, mnc string) string {
@@ -400,7 +448,11 @@ func (p CarrierTransportProfile) EffectivePrefer4500OnNATOnly() bool {
 
 func (p CarrierTransportProfile) EffectiveKeepSOCKSControlAlive() bool {
 	if p.KeepSOCKSControlAlive == nil {
-		return false
+		// 默认保活：SOCKS5 UDP relay 的生命周期绑定 TCP 控制连接（RFC 1928
+		// 语义），dialAddr 后立即 Close TCP 会让伦敦代理在数十秒后回收
+		// relay——设备实测隧道建立约 3 分钟后 ESP/keepalive 全部静默消失、
+		// 无 DPD 无重建（空 socket），会话静默死亡。保活 TCP 才能维持 relay。
+		return true
 	}
 	return *p.KeepSOCKSControlAlive
 }
@@ -410,4 +462,19 @@ func (p CarrierTransportProfile) EffectiveRequestPCSCF() bool {
 		return false
 	}
 	return *p.RequestPCSCF
+}
+
+// EffectiveCPMode / EffectiveCPOrder 暴露 CFG 地址族策略。
+func (p CarrierCPProfile) EffectiveCPMode() string {
+	if p.Mode == "" {
+		return "auto"
+	}
+	return p.Mode
+}
+
+func (p CarrierCPProfile) EffectiveCPOrder() []string {
+	if len(p.Order) == 0 {
+		return []string{"v4", "dual", "v6"}
+	}
+	return p.Order
 }

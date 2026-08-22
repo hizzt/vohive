@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 )
 
 const (
@@ -43,6 +44,14 @@ const (
 	NotifyUpdateSAAddresses          uint16 = 16400
 	NotifyCookie2                    uint16 = 16401
 	NotifyNoNATsAllowed              uint16 = 16402
+	NotifyInitialContact             uint16 = 16384
+	NotifyEAPOnlyAuthentication      uint16 = 16417
+	NotifyIKEv2FragmentationSupported uint16 = 16430
+	// 3GPP TS 24.302 §8.1.2 Table 8.1.2.3-1 私有状态通知（区间 40961-55911）
+	NotifyDeviceIdentity            uint16 = 41101
+	NotifyPCSCFRestoration          uint16 = 41304
+	// 3GPP TS 24.302 §7.2.2.2 附着拒绝（错误区间 9000-9099，其余 3GPP 私有错误散布在 <16384）
+	Notify3GGPGenericAttachRejection uint16 = 9000
 )
 
 const (
@@ -75,6 +84,7 @@ var (
 	ErrNotifyInvalidSelectors           = errors.New("ikev2 invalid selectors notify")
 	ErrNotifyUnacceptableAddresses      = errors.New("ikev2 unacceptable addresses notify")
 	ErrNotifyUnexpectedNATDetected      = errors.New("ikev2 unexpected nat detected notify")
+	ErrNotifyCookieChallenge            = errors.New("ikev2 cookie challenge notify")
 	ErrInvalidDelete                    = errors.New("invalid ikev2 delete payload")
 	ErrInvalidAddress                   = errors.New("invalid ikev2 address")
 )
@@ -320,13 +330,59 @@ func NotifyTypeName(notifyType uint16) string {
 		return "COOKIE2"
 	case NotifyNoNATsAllowed:
 		return "NO_NATS_ALLOWED"
+	case NotifyInitialContact:
+		return "INITIAL_CONTACT"
+	case NotifyEAPOnlyAuthentication:
+		return "EAP_ONLY_AUTHENTICATION"
+	case NotifyIKEv2FragmentationSupported:
+		return "IKEV2_FRAGMENTATION_SUPPORTED"
+	case NotifyDeviceIdentity:
+		return "DEVICE_IDENTITY"
+	case NotifyPCSCFRestoration:
+		return "P-CSCF_RESTORATION"
 	default:
+		if name, ok := notify3GGPName(notifyType); ok {
+			return name
+		}
 		return fmt.Sprintf("notify %d", notifyType)
 	}
 }
 
+// notify3GGPName 覆盖 TS 24.302 §7.2.2.2/§8.1.2 的常用 3GPP 通知编号。
+func notify3GGPName(notifyType uint16) (string, bool) {
+	names := map[uint16]string{
+		9000:  "3GPP_GENERIC_ATTACH_REJECTION",
+		9001:  "3GPP_ILLEGAL_UE",
+		9002:  "3GPP_ILLEGAL_ME",
+		9003:  "3GPP_3GPP_AUTH_PROTOCOL_ERROR",
+		9004:  "3GPP_SERVICE_NOT_ALLOWED",
+		9005:  "3GPP_SERVICE_SUBSCRIPTION_EXPIRED",
+		9006:  "3GPP_PLMN_NOT_ALLOWED",
+		10500: "3GPP_NETWORK_FAILURE",
+		11001: "3GPP_NO_APN_SUBSCRIPTION",
+		11011: "3GPP_PDN_LIMIT_EXCEEDED",
+		41101: "DEVICE_IDENTITY",
+		41304: "P-CSCF_RESTORATION",
+		16375: "3GPP_PRIVATE_16375 (Vodafone UK IPv4-only IMS hint)",
+	}
+	if name, ok := names[notifyType]; ok {
+		return name, true
+	}
+	if notifyType >= 9000 && notifyType <= 9099 {
+		return fmt.Sprintf("3GPP_ATTACH_REJECT_%d", notifyType), true
+	}
+	if notifyType >= 16375 && notifyType < 16384 {
+		return fmt.Sprintf("3GPP_PRIVATE_%d", notifyType), true
+	}
+	return "", false
+}
+
 func notifyErrorClass(notifyType uint16) error {
 	switch notifyType {
+	case NotifyCookie:
+		// COOKIE 不是错误，但必须包成 NotifyError 抛出，
+		// CookieChallengeFromError 才能从错误链里解出 cookie 供上层重发。
+		return ErrNotifyCookieChallenge
 	case NotifyUnsupportedCriticalPayload:
 		return ErrNotifyUnsupportedCriticalPayload
 	case NotifyInvalidIKESPI:
@@ -363,10 +419,24 @@ func notifyErrorClass(notifyType uint16) error {
 		return ErrNotifyUnexpectedNATDetected
 	default:
 		if notifyType < 16384 {
+			// TS 24.302 的 3GPP 错误（9000 段）与运营商私有错误（如 Vodafone 16375）
+			// 都落在错误区间，统一归类为通知错误，让 IKE_AUTH 阶段能看到拒绝理由。
 			return ErrIKEv2NotifyError
 		}
 		return nil
 	}
+}
+
+// Is3GGPAttachRejectNotify 判断是否 TS 24.302 §7.2.2.2 的附着拒绝通知。
+func Is3GGPAttachRejectNotify(notifyType uint16) bool {
+	if notifyType >= 9000 && notifyType <= 9099 {
+		return true
+	}
+	switch notifyType {
+	case 10500, 11001, 11011, 16375:
+		return true
+	}
+	return false
 }
 
 type Delete struct {
@@ -639,4 +709,121 @@ func appendUint64(dst []byte, v uint64) []byte {
 	var b [8]byte
 	binary.BigEndian.PutUint64(b[:], v)
 	return append(dst, b[:]...)
+}
+
+// --- 3GPP TS 24.302 IKEv2 通知 ---
+
+// DeviceIdentity 是 TS 24.302 §8.2.5.2 定义的设备身份（IMEI/IMEISV）。
+type DeviceIdentity struct {
+	IdentityType byte   // 0x01 = IMEI, 0x02 = IMEISV
+	Value        string // 十进制数字字符串
+}
+
+const (
+	DeviceIdentityTypeIMEI   byte = 0x01
+	DeviceIdentityTypeIMEISV byte = 0x02
+)
+
+// BCD 编码：低半字节=偶数位数字，高半字节=奇数位数字，不足补 0xF。
+func encodeDeviceIdentityBCD(value string) []byte {
+	out := make([]byte, 0, (len(value)+1)/2)
+	for i := 0; i < len(value); i += 2 {
+		lo := byte(0x0F)
+		if i < len(value) {
+			lo = value[i] - '0'
+		}
+		hi := byte(0x0F)
+		if i+1 < len(value) {
+			hi = value[i+1] - '0'
+		}
+		out = append(out, hi<<4|lo)
+	}
+	return out
+}
+
+func decodeDeviceIdentityBCD(data []byte) string {
+	var sb strings.Builder
+	for _, b := range data {
+		lo := b & 0x0F
+		hi := b >> 4
+		if lo < 10 {
+			sb.WriteByte('0' + lo)
+		}
+		if hi < 10 {
+			sb.WriteByte('0' + hi)
+		}
+	}
+	return sb.String()
+}
+
+// MarshalBinary 编码为 ePDG 期望的通知数据：[2 字节总长度][1 字节类型][BCD]。
+func (d DeviceIdentity) MarshalBinary() ([]byte, error) {
+	value := strings.TrimSpace(d.Value)
+	if value == "" {
+		return nil, fmt.Errorf("%w: empty device identity value", ErrInvalidNotify)
+	}
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return nil, fmt.Errorf("%w: non-digit device identity %q", ErrInvalidNotify, value)
+		}
+	}
+	switch d.IdentityType {
+	case DeviceIdentityTypeIMEI:
+		if len(value) != 15 {
+			return nil, fmt.Errorf("%w: IMEI length %d", ErrInvalidNotify, len(value))
+		}
+	case DeviceIdentityTypeIMEISV:
+		if len(value) != 16 {
+			return nil, fmt.Errorf("%w: IMEISV length %d", ErrInvalidNotify, len(value))
+		}
+	default:
+		return nil, fmt.Errorf("%w: unknown device identity type %d", ErrInvalidNotify, d.IdentityType)
+	}
+	bcd := encodeDeviceIdentityBCD(value)
+	out := make([]byte, 0, 3+len(bcd))
+	out = append(out, byte((3+len(bcd))>>8), byte(3+len(bcd)))
+	out = append(out, d.IdentityType)
+	out = append(out, bcd...)
+	return out, nil
+}
+
+// ParseDeviceIdentity 从 ePDG 的 DEVICE_IDENTITY 请求通知数据解析。
+// 请求侧数据：[1 字节请求类型][1 字节保留]（类型即期望的 Identity-Type）。
+func ParseDeviceIdentityRequest(n Notify) (byte, bool, error) {
+	if n.NotifyType != NotifyDeviceIdentity {
+		return 0, false, nil
+	}
+	if len(n.NotificationData) < 1 {
+		return 0, true, fmt.Errorf("%w: DEVICE_IDENTITY request data too short", ErrInvalidNotify)
+	}
+	return n.NotificationData[0], true, nil
+}
+
+// DeviceIdentityNotify 构造 DEVICE_IDENTITY 应答通知。
+func DeviceIdentityNotify(d DeviceIdentity) (Payload, error) {
+	data, err := d.MarshalBinary()
+	if err != nil {
+		return Payload{}, err
+	}
+	return NotifyPayload(Notify{
+		ProtocolID:       ProtocolIKE,
+		NotifyType:       NotifyDeviceIdentity,
+		NotificationData: data,
+	})
+}
+
+func InitialContactNotify() Payload {
+	body, _ := (Notify{NotifyType: NotifyInitialContact}).MarshalBinary()
+	return Payload{Type: PayloadNotify, Body: body}
+}
+
+func EAPOnlyAuthenticationNotify() Payload {
+	body, _ := (Notify{NotifyType: NotifyEAPOnlyAuthentication}).MarshalBinary()
+	return Payload{Type: PayloadNotify, Body: body}
+}
+
+// IKEv2FragmentationSupportedNotify 是 RFC 7383 的 USE_FRAG（P1 用，先占位常量化）。
+func IKEv2FragmentationSupportedNotify() Payload {
+	body, _ := (Notify{NotifyType: NotifyIKEv2FragmentationSupported}).MarshalBinary()
+	return Payload{Type: PayloadNotify, Body: body}
 }

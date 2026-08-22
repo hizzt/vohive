@@ -218,3 +218,83 @@ func countPayloadType(payloads []Payload, payloadType uint8) int {
 	}
 	return count
 }
+
+// TestRunIKESAInitCookieChallenge 验证 COOKIE 挑战：ePDG 回 Notify(COOKIE) 时
+// RunIKE_SA_INIT 返回可被 CookieChallengeFromError 解出的错误；带 cookie 重发时
+// 请求里携带 Notify(COOKIE)。
+func TestRunIKESAInitCookieChallenge(t *testing.T) {
+	cookieData := []byte{0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe}
+	var sawCookieInRequest bool
+	transport := InitTransportFunc(func(ctx context.Context, request []byte) ([]byte, error) {
+		req, err := ParseMessage(request)
+		if err != nil {
+			return nil, err
+		}
+		// 检查请求是否带了 cookie notify
+		for _, p := range req.Payloads {
+			if p.Type != PayloadNotify {
+				continue
+			}
+			n, err := ParseNotify(p.Body)
+			if err != nil {
+				continue
+			}
+			if n.NotifyType == NotifyCookie {
+				sawCookieInRequest = true
+				if !bytes.Equal(n.NotificationData, cookieData) {
+					t.Fatalf("cookie in request=%x want %x", n.NotificationData, cookieData)
+				}
+			}
+		}
+		if sawCookieInRequest {
+			// 第二轮（带 cookie）：回正常 SA_INIT 响应（最小构造触发后续解析错误即可，
+			// 这里只验证 cookie 传递与重发到达）
+			resp := Message{
+				Header: Header{
+					InitiatorSPI: req.Header.InitiatorSPI,
+					ResponderSPI: 0x1112131415161718,
+					ExchangeType: ExchangeIKE_SA_INIT,
+					Flags:        FlagResponse,
+				},
+				Payloads: []Payload{req.Payloads[0]},
+			}
+			return resp.MarshalBinary()
+		}
+		// 第一轮：回 COOKIE 挑战
+		cookiePayload, err := CookieNotify(cookieData)
+		if err != nil {
+			return nil, err
+		}
+		resp := Message{
+			Header: Header{
+				InitiatorSPI: req.Header.InitiatorSPI,
+				ResponderSPI: 0x1112131415161718,
+				ExchangeType: ExchangeIKE_SA_INIT,
+				Flags:        FlagResponse,
+			},
+			Payloads: []Payload{cookiePayload},
+		}
+		return resp.MarshalBinary()
+	})
+	cfg := InitConfig{
+		Transport:        transport,
+		InitiatorSPI:     1,
+		NonceI:           bytes.Repeat([]byte{0x01}, 32),
+		X25519PrivateKey: bytes.Repeat([]byte{0x02}, 32),
+	}
+	// 第一轮：COOKIE 挑战错误可解出 cookie
+	_, err := RunIKE_SA_INIT(context.Background(), cfg)
+	cookie, ok := CookieChallengeFromError(err)
+	if !ok {
+		t.Fatalf("RunIKE_SA_INIT() err=%v, want COOKIE challenge", err)
+	}
+	if !bytes.Equal(cookie, cookieData) {
+		t.Fatalf("cookie=%x want %x", cookie, cookieData)
+	}
+	// 第二轮：带 cookie 重发，请求里必须携带 cookie（transport 里断言）
+	cfg.Cookie = cookie
+	_, _ = RunIKE_SA_INIT(context.Background(), cfg)
+	if !sawCookieInRequest {
+		t.Fatal("重发的 SA_INIT 请求未携带 Notify(COOKIE)")
+	}
+}

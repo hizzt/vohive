@@ -11,6 +11,8 @@ import (
 	"github.com/iniwex5/vowifi-go/runtimehost/eventhost"
 	"github.com/iniwex5/vowifi-go/runtimehost/messaging"
 	"github.com/iniwex5/vowifi-go/runtimehost/voicehost"
+
+	"github.com/iniwex5/vohive/pkg/logger"
 )
 
 type runtimeStartFunc func(context.Context, runtimehost.StartRequest) (*runtimehost.Instance, error)
@@ -114,11 +116,20 @@ func (m *Manager) StartRuntime(ctx context.Context, req RuntimeStartRequest) (Ru
 	}
 
 	inst.AddObserver(runtimehost.ObserverFunc(func(_ context.Context, ev runtimehost.Event) {
-		if m.IsCurrentInstance(deviceID, inst) {
-			m.BroadcastState(deviceID)
+		if !m.IsCurrentInstance(deviceID, inst) {
+			m.RecordStartupState(deviceID, ev.State)
 			return
 		}
-		m.RecordStartupState(deviceID, ev.State)
+		// 数据面 pump 死亡（runtimehost watchTunnelPump 翻 PhaseError）：
+		// 移除 instance 让 Active=false，目标态 reconcile 兜底重建。
+		// 不移除则 Active 永真，VoWiFi 静默死亡后永不自愈（设备实测）。
+		if ev.State.Phase == runtimehost.PhaseError {
+			m.RuntimeStore().DeleteInstance(deviceID, inst)
+			logger.Warn("VoWiFi 数据面异常退出，已下线实例等待目标态恢复重建",
+				"device", deviceID,
+				"reason", ev.State.LastReason)
+		}
+		m.BroadcastState(deviceID)
 	}))
 
 	if !m.ClaimStarted(deviceID, req.Epoch, inst) {

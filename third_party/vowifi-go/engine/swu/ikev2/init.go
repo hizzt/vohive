@@ -11,6 +11,7 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"os"
 	"strings"
 	"time"
 )
@@ -98,6 +99,7 @@ type InitConfig struct {
 		RemoteIP          net.IP
 		RemotePort        uint16
 		KeyMaterialLength int
+		Cookie            []byte // ePDG COOKIE 挑战返回的 cookie：非空时 SA_INIT 请求携带 Notify(COOKIE)
 	}
 
 type InitResult struct {
@@ -190,6 +192,13 @@ priv, err := x25519PrivateKey(cfg.X25519PrivateKey, random)
 		}
 		payloads = append(payloads, initNATPayloads(cfg, spiI, 0)...)
 		payloads = append(payloads, MOBIKESupportedNotify())
+		if len(cfg.Cookie) > 0 {
+			// COOKIE 挑战重发：RFC 7296 §2.6 要求把 ePDG 给的 cookie
+			// 原样放进 Notify(COOKIE) 重发 SA_INIT。
+			if cookiePayload, cerr := CookieNotify(cfg.Cookie); cerr == nil {
+				payloads = append(payloads, cookiePayload)
+			}
+		}
 		req := Message{
 			Header: Header{
 				InitiatorSPI: spiI,
@@ -247,6 +256,18 @@ priv, err := x25519PrivateKey(cfg.X25519PrivateKey, random)
 	if err != nil {
 		return InitResult{}, err
 	}
+	if os.Getenv("SWU_DEBUG_IKE") != "" {
+		fmt.Fprintf(os.Stderr, "[swu] SA_INIT response (%d bytes): %x\n", len(respBytes), respBytes)
+		for i, p := range parsed.sa.Proposals {
+			fmt.Fprintf(os.Stderr, "[swu] ePDG selected proposal #%d: %+v\n", i+1, p.Transforms)
+		}
+		fmt.Fprintf(os.Stderr, "[swu] key profile: %+v\n", profile)
+		fmt.Fprintf(os.Stderr, "[swu] DH shared (%d bytes): %x\n", len(shared), shared)
+		fmt.Fprintf(os.Stderr, "[swu] nonceI: %x\n", nonceI)
+		fmt.Fprintf(os.Stderr, "[swu] nonceR: %x\n", parsed.nonceR)
+		fmt.Fprintf(os.Stderr, "[swu] skeyseed: %x\n", skeyseed)
+		fmt.Fprintf(os.Stderr, "[swu] key material (%d bytes): %x\n", len(keyMaterial), keyMaterial)
+	}
 	var keys IKEKeys
 	if len(keyMaterial) >= profile.RequiredLength() {
 		keys, err = SplitIKEKeys(profile, keyMaterial)
@@ -284,17 +305,34 @@ type parsedInitResponse struct {
 	mobikeSupported bool
 }
 
+// CookieChallengeFromError 从错误链里取回 COOKIE 挑战的 cookie 数据
+// （RFC 7296 §2.6：ePDG 负载保护，需带原 cookie 重发 SA_INIT）。
+func CookieChallengeFromError(err error) ([]byte, bool) {
+	var notifyErr *NotifyError
+	if !errors.As(err, &notifyErr) {
+		return nil, false
+	}
+	if notifyErr.Notify.NotifyType != NotifyCookie {
+		return nil, false
+	}
+	cookie, ok, cerr := notifyErr.Notify.Cookie()
+	if cerr != nil || !ok {
+		return nil, false
+	}
+	return cookie, true
+}
+
 func parseInitResponse(resp Message, spiI uint64) (parsedInitResponse, error) {
 	h := resp.Header
 	if h.InitiatorSPI != spiI {
 		return parsedInitResponse{}, fmt.Errorf("%w: initiator SPI mismatch", ErrInvalidInitResponse)
 	}
-	if h.ResponderSPI == 0 {
-		return parsedInitResponse{}, fmt.Errorf("%w: responder SPI is zero", ErrInvalidInitResponse)
-	}
 	if h.ExchangeType != ExchangeIKE_SA_INIT || h.MessageID != 0 || h.Flags&FlagResponse == 0 {
 		return parsedInitResponse{}, fmt.Errorf("%w: unexpected header", ErrInvalidInitResponse)
 	}
+	// RFC 7296 §2.21/§2.6：SA_INIT 的错误响应（INVALID_KE_PAYLOAD、COOKIE 等）
+	// SPIr 为 0 是合法形态——先扫 notify，有错误通知就按通知路径返回，
+	// 只有没有通知且 SPIr=0 时才是真正的非法响应。
 	var out parsedInitResponse
 	for _, p := range resp.Payloads {
 		switch p.Type {
@@ -307,10 +345,25 @@ func parseInitResponse(resp Message, spiI uint64) (parsedInitResponse, error) {
 			if n.NotifyType == NotifyInvalidKEPayload {
 				return parsedInitResponse{}, NotifyErrorFor(n)
 			}
+			if n.NotifyType == NotifyCookie {
+				// COOKIE 挑战响应只有 notify 无 SA/KE/Nonce，不能落进
+				// 缺字段报错路径——包成 NotifyError 抛出，上层带 cookie 重发。
+				if _, ok, cerr := n.Cookie(); cerr == nil && ok {
+					return parsedInitResponse{}, NotifyErrorFor(n)
+				}
+			}
 			if n.NotifyType == NotifyMOBIKESupported {
 				out.mobikeSupported = true
 			}
 		}
+	}
+	if h.ResponderSPI == 0 {
+		// 无错误通知但 SPIr=0：可能是未知通知类错误，归类为通用 notify 错误
+		// （若 notifies 里有错误型通知）或无效响应。
+		if err := FirstNotifyError(resp.Payloads); err != nil {
+			return parsedInitResponse{}, err
+		}
+		return parsedInitResponse{}, fmt.Errorf("%w: responder SPI is zero", ErrInvalidInitResponse)
 	}
 	for _, p := range resp.Payloads {
 		switch p.Type {

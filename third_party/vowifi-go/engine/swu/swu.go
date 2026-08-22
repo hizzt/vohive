@@ -86,6 +86,7 @@ type TunnelResult struct {
 	LocalInnerIP      string
 	RemoteInnerIP     string
 	DNSServers        []string
+	PSCFAddress       string
 	IKEEstablished    bool
 	IPsecEstablished  bool
 	MOBIKESupported   bool

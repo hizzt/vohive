@@ -31,8 +31,22 @@ func (f *authFakeTransport) ExchangeIKE(ctx context.Context, request []byte) ([]
 			f.t.Fatalf("first auth header=%+v", msg.Header)
 		}
 		f.firstInner = clonePayloads(inner)
-		if gotTypes(inner); !bytes.Equal(gotTypes(inner), []byte{PayloadIDi, PayloadCP, PayloadSA, PayloadTSi, PayloadTSr}) {
-			f.t.Fatalf("first inner types=%v", gotTypes(inner))
+		// 新顺序（对齐 vowifi_gateway）：IDi, [IDr], CP, SA, TSi, TSr, N(INITIAL_CONTACT), [N(DEVICE_IDENTITY)], N(EAP_ONLY_AUTHENTICATION)
+		types := gotTypes(inner)
+		wantPrefix := []byte{PayloadIDi, PayloadCP, PayloadSA, PayloadTSi, PayloadTSr}
+		if !bytes.Equal(types[:5], wantPrefix) {
+			f.t.Fatalf("first inner types=%v", types)
+		}
+		notifyTypes := []uint16{}
+		for _, p := range inner {
+			if p.Type == PayloadNotify {
+				if n, err := ParseNotify(p.Body); err == nil {
+					notifyTypes = append(notifyTypes, n.NotifyType)
+				}
+			}
+		}
+		if len(notifyTypes) != 3 || notifyTypes[0] != NotifyInitialContact || notifyTypes[1] != NotifyMOBIKESupported || notifyTypes[2] != NotifyEAPOnlyAuthentication {
+			f.t.Fatalf("notify types=%v", notifyTypes)
 		}
 		req, err := (eapaka.Packet{
 			Code:       eapaka.CodeRequest,
@@ -162,7 +176,8 @@ func TestRunIKEAuthFullCompletesAKAWithNotification(t *testing.T) {
 		}
 		switch exchanges {
 		case 0:
-			if msg.Header.MessageID != 1 || !bytes.Equal(gotTypes(inner), []byte{PayloadIDi, PayloadCP, PayloadSA, PayloadTSi, PayloadTSr}) {
+			// 新顺序（对齐 vowifi_gateway）：IDi, CP, SA, TSi, TSr, N(INITIAL_CONTACT), N(EAP_ONLY_AUTHENTICATION)
+			if msg.Header.MessageID != 1 || !bytes.Equal(gotTypes(inner)[:5], []byte{PayloadIDi, PayloadCP, PayloadSA, PayloadTSi, PayloadTSr}) {
 				t.Fatalf("initial auth header=%+v inner types=%v", msg.Header, gotTypes(inner))
 			}
 			req := eapaka.Packet{

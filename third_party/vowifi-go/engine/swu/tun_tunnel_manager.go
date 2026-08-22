@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -134,6 +136,12 @@ func (m *TUNTunnelManager) EstablishTunnel(ctx context.Context, cfg TunnelConfig
 		_ = pump.Close(ctx)
 		return nil, err
 	}
+	// 空闲保活：每 20s 发 ESP 层 ICMP echo（对端必回，双向 ESP 流维持
+	// ePDG/代理链路），无响应判定死链关会话触发重建。设备实测 IKE 空
+	// INFORMATIONAL 探测在本环境 ~40s 后被 ePDG 无视，ESP 层探测始终有效。
+	if livenessSession, ok := packetSession.(*PacketSession); ok {
+		livenessSession.StartLivenessLoop(context.Background())
+	}
 	return &TUNPacketTunnelSession{
 		base:           packetSession,
 		pump:           pump,
@@ -202,7 +210,20 @@ func (m *TUNTunnelManager) routingConfig(ctx context.Context, cfg TunnelConfig, 
 }
 
 func (m *TUNTunnelManager) defaultEPDGRouteExclusions(ctx context.Context, cfg TunnelConfig, result TunnelResult, routes []TUNRoute) ([]EPDGRouteExclusion, error) {
-	if strings.TrimSpace(cfg.LocalInterface) == "" {
+	outerIface := strings.TrimSpace(cfg.LocalInterface)
+	// LocalInterface 语义是"ePDG 出站网络接口名"（如 wlan0），但 runtimehost 把
+	// modem.DeviceID（设备逻辑 ID，非网络接口）填了进来——若它不是真实接口，
+	// 回退到默认路由的接口名，否则 ip route add 会 "Cannot find device"。
+	if outerIface != "" {
+		if _, err := net.InterfaceByName(outerIface); err != nil {
+			fallback := defaultRouteInterface()
+			if fallback == "" {
+				return nil, fmt.Errorf("%w: LocalInterface %q is not a real interface and no default route found", ErrInvalidTUNTunnelManager, outerIface)
+			}
+			outerIface = fallback
+		}
+	}
+	if outerIface == "" {
 		return nil, fmt.Errorf("%w: ePDG route protection requires outer interface", ErrInvalidTUNTunnelManager)
 	}
 	host := tunnelAddressHost(firstPacketNonEmpty(result.EPDGAddress, cfg.EPDGAddress))
@@ -225,7 +246,7 @@ func (m *TUNTunnelManager) defaultEPDGRouteExclusions(ctx context.Context, cfg T
 		}
 		out = append(out, EPDGRouteExclusion{
 			Address:       normalized.String(),
-			InterfaceName: strings.TrimSpace(cfg.LocalInterface),
+			InterfaceName: outerIface,
 			Source:        strings.TrimSpace(cfg.OuterLocalIP),
 			Tables:        tables,
 		})
@@ -283,6 +304,34 @@ func (s *TUNPacketTunnelSession) Result() TunnelResult {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return cloneTunnelResult(s.result)
+}
+
+// PumpDone 返回 packet pump 结束信号（pump 任一方向读/写出错退出即关闭）。
+// 供上层监督：pump 死亡意味着数据面已停（socket 回收/链路断），会话应视为
+// 失效并触发重建——设备实测 ESP read 错误退出后无任何日志，上层 store 的
+// active 标记永真，目标态 reconcile 永不触发，VoWiFi 静默死亡。
+func (s *TUNPacketTunnelSession) PumpDone() <-chan struct{} {
+	if s == nil || s.pump == nil {
+		ch := make(chan struct{})
+		close(ch)
+		return ch
+	}
+	return s.pump.Done()
+}
+
+// PumpErr 返回 pump 退出原因（PumpDone 关闭后有效；正常关闭返回 nil）。
+// 注意 Wait 会阻塞到 pump 结束，只应在 PumpDone 触发后调用。
+func (s *TUNPacketTunnelSession) PumpErr() error {
+	if s == nil || s.pump == nil {
+		return nil
+	}
+	select {
+	case <-s.pump.Done():
+		_, err := s.pump.Wait()
+		return err
+	default:
+		return nil // pump 仍在运行
+	}
 }
 
 func (s *TUNPacketTunnelSession) MOBIKE(ctx context.Context, req MOBIKERequest) (MOBIKEResult, error) {
@@ -388,4 +437,35 @@ func cloneTUNRules(in []TUNRule) []TUNRule {
 	out := make([]TUNRule, len(in))
 	copy(out, in)
 	return out
+}
+
+// defaultRouteInterface 返回默认路由的出站网络接口名（如 wlan0）。
+func defaultRouteInterface() string {
+	// /proc/net/route 列序：Iface Destination Gateway Flags RefCnt Use Metric Mask ...
+	// 默认路由 = Destination 00000000 且 Gateway 非 00000000（Flags 在第 4 列）。
+	data, err := os.ReadFile("/proc/net/route")
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n")[1:] {
+		fields := strings.Fields(line)
+		if len(fields) < 8 {
+			continue
+		}
+		if fields[1] != "00000000" {
+			continue
+		}
+		if flagsHasGateway(fields[3]) || fields[2] != "00000000" {
+			return fields[0]
+		}
+	}
+	return ""
+}
+
+func flagsHasGateway(flagsHex string) bool {
+	flags, err := strconv.ParseUint(flagsHex, 16, 32)
+	if err != nil {
+		return false
+	}
+	return flags&0x2 != 0
 }

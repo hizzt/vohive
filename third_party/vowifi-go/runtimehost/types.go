@@ -412,8 +412,54 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 	if req.VoiceGateway != nil {
 		req.VoiceGateway.RegisterAgent(req.DeviceID, inst)
 	}
+	inst.watchTunnelPump()
 	inst.notify(ctx)
 	return inst, nil
+}
+
+// watchTunnelPump 监督 TUN packet pump：pump 任一方向读/写出错退出即数据面
+// 死亡（设备实测：SOCKS5 relay 被代理回收后 ESP read 报错退出，但无任何
+// 日志，store 的 active 标记永真，目标态 reconcile 永不触发——VoWiFi 静默
+// 死亡）。这里翻 Phase=error 并广播观察者，让上层 reconcile 接管重建。
+func (i *Instance) watchTunnelPump() {
+	if i == nil {
+		return
+	}
+	session, ok := i.tunnel.(*swu.TUNPacketTunnelSession)
+	if !ok || session == nil {
+		return
+	}
+	done := session.PumpDone()
+	if done == nil {
+		return
+	}
+	go func() {
+		<-done
+		i.mu.Lock()
+		if i.stopped {
+			i.mu.Unlock()
+			return // 正常 Stop 触发的关闭，不算异常
+		}
+		pumpErr := session.PumpErr()
+		reason := "tunnel pump exited"
+		if pumpErr != nil {
+			reason = pumpErr.Error()
+		}
+		i.state.Phase = PhaseError
+		i.state.TunnelReady = false
+		i.state.IMSReady = false
+		i.state.SMSReady = false
+		i.state.LastReason = reason
+		i.state.UpdatedAt = time.Now()
+		i.mu.Unlock()
+		// 主动关闭会话清理路由/TUN/socket：pump 出错路径只结束 goroutine，
+		// 不走 Close 的清理逻辑；不关则残留的 ePDG host 路由让重建时
+		// `ip route add ... File exists` 失败（设备实测）。
+		closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		_ = session.Close(closeCtx)
+		cancel()
+		i.notify(context.Background())
+	}()
 }
 
 func buildRuntimeVoiceAgent(req StartRequest, reg IMSRegistrationResult) voicehost.Agent {

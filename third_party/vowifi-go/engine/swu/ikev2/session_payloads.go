@@ -153,6 +153,35 @@ func SWuConfigurationRequest() Configuration {
 	}}
 }
 
+// SWuConfigurationRequestForCPMode 按地址族构造 CFG 请求（vowifi_gateway apply_cp_ts_mode）：
+// 单族只请求该族属性并带上该族 P-CSCF；dual 请求 v4 在前 v6 在后。
+// 单族请求 P-CSCF 是 IMS 注册的硬需求（Vodafone UK 等 IPv4-only IMS 不回 DNS 也能给 P-CSCF）。
+func SWuConfigurationRequestForCPMode(mode string) Configuration {
+	switch mode {
+	case "v4":
+		return Configuration{Type: CFGRequest, Attributes: []ConfigurationAttribute{
+			{Type: ConfigInternalIPv4Address},
+			{Type: ConfigInternalIPv4DNS},
+			{Type: ConfigInternalIPv4Pcscf},
+		}}
+	case "v6":
+		return Configuration{Type: CFGRequest, Attributes: []ConfigurationAttribute{
+			{Type: ConfigInternalIPv6Address},
+			{Type: ConfigInternalIPv6DNS},
+			{Type: ConfigInternalIPv6Pcscf},
+		}}
+	default: // dual / 未知：v4 在前 v6 在后，与旧 SWuConfigurationRequest 兼容但补 P-CSCF
+		return Configuration{Type: CFGRequest, Attributes: []ConfigurationAttribute{
+			{Type: ConfigInternalIPv4Address},
+			{Type: ConfigInternalIPv4DNS},
+			{Type: ConfigInternalIPv4Pcscf},
+			{Type: ConfigInternalIPv6Address},
+			{Type: ConfigInternalIPv6DNS},
+			{Type: ConfigInternalIPv6Pcscf},
+		}}
+	}
+}
+
 type TrafficSelector struct {
 	Type       uint8
 	IPProtocol uint8

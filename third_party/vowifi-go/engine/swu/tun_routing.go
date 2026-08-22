@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"net/netip"
 	"os/exec"
 	"strconv"
@@ -108,11 +109,17 @@ func (m LinuxTUNRoutingManager) Apply(ctx context.Context, cfg TUNRoutingConfig)
 	state := TUNRoutingState{InterfaceName: strings.TrimSpace(cfg.InterfaceName)}
 	for _, command := range commands {
 		if err := runner.RunIP(ctx, command.args...); err != nil {
-			rollbackErr := runIPUndo(ctx, runner, state.undo)
-			if rollbackErr != nil {
-				return state, errors.Join(err, rollbackErr)
+			// ePDG host 路由幂等：重建会话时旧路由可能因异常退出未清理，
+			// `ip route add` 报 File exists（RTNETLINK exit status 2）。
+			// 路由已存在=目标态已满足，跳过继续（设备实测此错曾让重建
+			// 失败进入退避循环）。其余错误仍回滚返回。
+			if !isRouteAlreadyExistsError(err) {
+				rollbackErr := runIPUndo(ctx, runner, state.undo)
+				if rollbackErr != nil {
+					return state, errors.Join(err, rollbackErr)
+				}
+				return state, err
 			}
-			return state, err
 		}
 		if len(command.undo) > 0 {
 			state.undo = append(state.undo, ipCommand{args: append([]string(nil), command.undo...)})
@@ -416,4 +423,17 @@ func normalizeRoutingToken(value, field string) (string, error) {
 		return "", fmt.Errorf("%w: invalid %s %q", ErrInvalidTUNRouting, field, value)
 	}
 	return value, nil
+}
+
+// isRouteAlreadyExistsError 判断 ip route add 失败是否因目标路由已存在
+// （RTNETLINK answers: File exists）。此时路由目标态已满足，可幂等跳过。
+func isRouteAlreadyExistsError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, os.ErrExist) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "File exists") || strings.Contains(msg, "已存在")
 }

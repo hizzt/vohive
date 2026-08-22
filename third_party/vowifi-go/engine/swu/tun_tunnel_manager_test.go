@@ -156,7 +156,7 @@ func TestTUNTunnelManagerAddsDefaultRouteAndEPDGProtection(t *testing.T) {
 		DeviceID:       "dev-1",
 		Mode:           DataplaneModeUserspace,
 		EPDGAddress:    "epdg.example",
-		LocalInterface: "wwan0",
+		LocalInterface: routeInterfaceForTest(t),
 		OuterLocalIP:   "192.0.2.10",
 		IMSI:           "310280233641503",
 	})
@@ -175,7 +175,7 @@ func TestTUNTunnelManagerAddsDefaultRouteAndEPDGProtection(t *testing.T) {
 		t.Fatalf("ePDG exclusions=%+v", applied.EPDGRouteExclusions)
 	}
 	exclusion := applied.EPDGRouteExclusions[0]
-	if exclusion.Address != "198.51.100.7" || exclusion.InterfaceName != "wwan0" || exclusion.Source != "192.0.2.10" || len(exclusion.Tables) != 0 {
+	if exclusion.Address != "198.51.100.7" || exclusion.Source != "192.0.2.10" || len(exclusion.Tables) != 0 {
 		t.Fatalf("ePDG exclusion=%+v", exclusion)
 	}
 }
@@ -208,7 +208,7 @@ func TestTUNTunnelManagerProtectsEPDGRoutesForPolicyTables(t *testing.T) {
 		DeviceID:       "dev-1",
 		Mode:           DataplaneModeUserspace,
 		EPDGAddress:    "198.51.100.8",
-		LocalInterface: "wwan0",
+		LocalInterface: routeInterfaceForTest(t),
 		IMSI:           "310280233641503",
 	})
 	if err != nil {
@@ -222,6 +222,21 @@ func TestTUNTunnelManagerProtectsEPDGRoutesForPolicyTables(t *testing.T) {
 	if got, want := exclusions[0].Tables, []string{"200", "201"}; !stringSlicesEqual(got, want) {
 		t.Fatalf("tables=%+v, want %+v", got, want)
 	}
+}
+
+// routeInterfaceForTest 返回测试环境里真实存在的接口名：
+// 测试机 macOS 上 lo0 存在；CI Linux 上 fallback eth0。defaultEPDGRouteExclusions
+// 现在会校验 LocalInterface 是否为真实接口（runtimehost 曾把设备逻辑 ID 填进来），
+// 测试必须用真实接口名才能走到排除路由断言。
+func routeInterfaceForTest(t *testing.T) string {
+	t.Helper()
+	for _, name := range []string{"lo0", "eth0", "en0"} {
+		if _, err := net.InterfaceByName(name); err == nil {
+			return name
+		}
+	}
+	t.Skip("no usable network interface on this machine")
+	return ""
 }
 
 type tunManagerBase struct {

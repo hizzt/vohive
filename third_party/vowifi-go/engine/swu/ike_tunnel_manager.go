@@ -86,6 +86,9 @@ type IKEPacketTunnelManagerConfig struct {
 	AdditionalAddresses      []net.IP
 	NoAdditionalAddresses    bool
 	DisableControlPlaneHooks bool
+	// EPDGResolver 覆盖 ePDG FQDN 解析（测试注入；nil 走
+	// resolveEPDGAddresses 的系统 DNS + DoH ECS 回退链）。
+	EPDGResolver ipAddrResolver
 }
 
 type IKEPacketTunnelManager struct {
@@ -147,12 +150,13 @@ func (m *IKEPacketTunnelManager) EstablishTunnel(ctx context.Context, cfg Tunnel
 	if random == nil {
 		random = rand.Reader
 	}
-	transportCfg, espCfg := m.transportConfigs(cfg, epdg)
+	transportCfg, espCfg := m.transportConfigs(ctx, cfg, epdg)
 	transport, err := m.ikeTransport(cfg, transportCfg)
 	if err != nil {
 		return nil, err
 	}
-childSPI, err := m.childSPI(random)
+	prof := m.carrierProfile(cfg)
+	childSPI, err := m.childSPI(random)
 	if err != nil {
 		return nil, err
 	}
@@ -164,12 +168,28 @@ childSPI, err := m.childSPI(random)
 	if initRunner == nil {
 		initRunner = ikev2.RunIKE_SA_INIT
 	}
-	init, err := m.runIKEInitWithProfile(ctx, initRunner, transport, transportCfg, random, sa, m.carrierProfile(cfg))
+	init, err := m.runIKEInitWithProfile(ctx, initRunner, transport, transportCfg, random, sa, prof)
 	if err != nil {
 		return nil, err
 	}
+	// NAT 协商一次性诊断：无论走哪个分支都把决策输入与结果打全（SWU_DEBUG_IKE 开启时），
+	// 避免为取日志反复发版。
+	if os.Getenv("SWU_DEBUG_IKE") != "" {
+		fmt.Fprintf(os.Stderr, "[swu] NAT diag: detected=%t local=%s:%d remote=%s:%d prefer4500=%t keepAlive=%t profile=%s\n",
+			init.NATDetected, transportCfg.LocalIP, transportCfg.LocalPort, transportCfg.RemoteIP, transportCfg.RemotePort,
+			prof.Transport.EffectivePrefer4500OnNATOnly(), prof.Transport.EffectiveKeepSOCKSControlAlive(), prof.PresetID)
+		for _, p := range init.Response.Payloads {
+			if p.Type != ikev2.PayloadNotify {
+				continue
+			}
+			n, err := ikev2.ParseNotify(p.Body)
+			if err != nil {
+				continue
+			}
+			fmt.Fprintf(os.Stderr, "[swu] NAT diag: ePDG notify %d (%s) data=%x\n", n.NotifyType, ikev2.NotifyTypeName(n.NotifyType), n.NotificationData)
+		}
+	}
 	if init.NATDetected {
-		prof := m.carrierProfile(cfg)
 		if prof.Transport.EffectivePrefer4500OnNATOnly() {
 			if natt, ok := transport.(interface{ SwitchToNATT() }); ok {
 				fmt.Fprintf(os.Stderr, "[swu] NAT detected, switching to 4500 (profile %s)\n", prof.PresetID)
@@ -189,7 +209,7 @@ childSPI, err := m.childSPI(random)
 	}
 	childSA := m.Config.ChildSA
 	if len(childSA.Proposals) == 0 {
-		childSA = espProposalForCarrier(m.carrierProfile(cfg), childSPI)
+		childSA = espProposalForCarrier(prof, childSPI)
 	}
 	tsi := m.Config.TSi
 	if len(tsi.Selectors) == 0 {
@@ -201,12 +221,17 @@ childSPI, err := m.childSPI(random)
 	}
 	cfgCP := m.Config.Configuration
 	if len(cfgCP.Attributes) == 0 {
-		cfgCP = ikev2.SWuConfigurationRequest()
-		if m.carrierProfile(cfg).Transport.EffectiveRequestPCSCF() {
-			cfgCP.Attributes = append(cfgCP.Attributes,
-				ikev2.ConfigurationAttribute{Type: ikev2.ConfigInternalIPv4Pcscf},
-				ikev2.ConfigurationAttribute{Type: ikev2.ConfigInternalIPv6Pcscf},
-			)
+		cfgCP = ikev2.SWuConfigurationRequestForCPMode(cpModeForProfile(prof))
+	}
+	// IDr：裸 APN（ID_FQDN），对齐 vowifi_gateway 的默认 SWU_IDR_MODE=apn。
+	var responderID *ikev2.Identity
+	responderID = &ikev2.Identity{Type: ikev2.IDFQDN, Data: []byte(defaultAPNForAuth)}
+	// DEVICE_IDENTITY：ePDG 若在 IKE_AUTH 请求设备身份，需要 IMEI/IMEISV 应答。
+	var deviceIdentity *ikev2.DeviceIdentity
+	if imei := strings.TrimSpace(cfg.IMEI); len(imei) == 15 {
+		deviceIdentity = &ikev2.DeviceIdentity{
+			IdentityType: ikev2.DeviceIdentityTypeIMEI,
+			Value:        imei,
 		}
 	}
 	auth, err := authRunner(ctx, ikev2.FullAuthConfig{
@@ -216,6 +241,8 @@ childSPI, err := m.childSPI(random)
 		SIM:                provider,
 		EAPKeys:            reauth.Keys,
 		InitiatorID:        initiatorID,
+		ResponderID:        responderID,
+		DeviceIdentity:     deviceIdentity,
 		EAPIdentity:        identity,
 		EAPReauthIdentity:  reauth.Identity,
 		EAPReauthCounter:   reauth.Counter,
@@ -240,7 +267,7 @@ childSPI, err := m.childSPI(random)
 		return nil, err
 	}
 	result := tunnelResultFromIKE(cfg, epdg, init, child)
-	closeHandler, mobikeHandler := m.controlHandlers(transport, init, auth, child, result, transportCfg)
+	closeHandler, mobikeHandler, livenessHandler := m.controlHandlers(transport, init, auth, child, result, transportCfg)
 	sessionFactory := m.Config.PacketSessionFactory
 	if sessionFactory == nil {
 		sessionFactory = func(pc PacketSessionConfig) (TunnelSession, error) {
@@ -248,12 +275,13 @@ childSPI, err := m.childSPI(random)
 		}
 	}
 	session, err := sessionFactory(PacketSessionConfig{
-		Result:        result,
-		ChildSA:       child,
-		Transport:     espTransport,
-		Random:        random,
-		MOBIKEHandler: mobikeHandler,
-		CloseHandler:  closeHandler,
+		Result:          result,
+		ChildSA:         child,
+		Transport:       espTransport,
+		Random:          random,
+		MOBIKEHandler:   mobikeHandler,
+		CloseHandler:    closeHandler,
+		LivenessHandler: livenessHandler,
 	})
 	if err != nil {
 		if closer, ok := espTransport.(ESPPacketTransportCloser); ok {
@@ -332,28 +360,41 @@ func (m *IKEPacketTunnelManager) runIKEInitWithProfile(
 		attempts = append(attempts, dhAttempt{group: g, name: dhGroupName(g)})
 	}
 
-	var lastErr error
-	for _, a := range attempts {
-		filtered := filterProposalsByDHGroup(sa, a.group)
-		if len(filtered.Proposals) == 0 {
-			lastErr = fmt.Errorf("no proposals match DH group %d", a.group)
-			continue
-		}
-		result, err := initRunner(ctx, ikev2.InitConfig{
-				Transport: transport,
+	// COOKIE 挑战重试（RFC 7296 §2.6）：ePDG 负载保护时回 Notify(COOKIE)，
+	// 需带原 cookie 重发 SA_INIT；上限 2 次防乒乓（对齐 VoCat）。
+	var cookie []byte
+	for cookieRound := 0; cookieRound <= 2; cookieRound++ {
+		var lastErr error
+		for _, a := range attempts {
+			// SA 提议始终全量发送（对齐 1.5.5/vowifi_gateway）：ePDG 对
+			// 不匹配的"单提案" SA_INIT 会静默丢包（不回 NO_PROPOSAL_CHOSEN），
+			// 之前按 DH group 过滤成单提案导致 100% 无响应；全量 4 提案 +
+			// 每轮换 KE 的 DH group，ePDG 可直接从提案里选出匹配组合。
+			if len(sa.Proposals) == 0 {
+				lastErr = fmt.Errorf("no proposals for DH group %d", a.group)
+				continue
+			}
+			result, err := initRunner(ctx, ikev2.InitConfig{
+				Transport:  transport,
 				Random:     random,
-				SA:         filtered,
+				SA:         sa,
 				DHGroup:    a.group,
 				LocalIP:    transportCfg.LocalIP,
 				LocalPort:  transportCfg.LocalPort,
 				RemoteIP:   transportCfg.RemoteIP,
 				RemotePort: transportCfg.RemotePort,
+				Cookie:     cookie,
 			})
 			if err == nil {
 				fmt.Fprintf(os.Stderr, "[swu] IKE_SA_INIT succeeded with DH group %s\n", a.name)
 				return result, nil
 			}
 			lastErr = err
+			if c, ok := ikev2.CookieChallengeFromError(err); ok {
+				cookie = c
+				fmt.Fprintf(os.Stderr, "[swu] ePDG COOKIE challenge (round %d), resending SA_INIT with cookie\n", cookieRound+1)
+				break // 带 cookie 重发，从头再走全部 DH 尝试
+			}
 			if sg, ok, _ := ikev2.InvalidKEPayloadAlternativeGroupFromError(err); ok {
 				fmt.Fprintf(os.Stderr, "[swu] ePDG suggested DH group %s (%d), will prefer it if available\n", dhGroupName(sg), sg)
 			}
@@ -362,8 +403,14 @@ func (m *IKEPacketTunnelManager) runIKEInitWithProfile(
 				continue
 			}
 			return ikev2.InitResult{}, err
+		}
+		// 本轮没有遇到 COOKIE 挑战（内层循环自然结束或不可重试错误已返回）
+		if cookie == nil {
+			return ikev2.InitResult{}, lastErr
+		}
+		// 下一轮 cookie 重发前清空 lastErr；若重发后仍失败且无新 cookie，由循环末尾返回
 	}
-	return ikev2.InitResult{}, lastErr
+	return ikev2.InitResult{}, fmt.Errorf("ePDG COOKIE 挑战重试超过上限")
 }
 
 // isIKEInitRetryableError 判断 IKE_SA_INIT 错误是否应降级重试。
@@ -386,7 +433,8 @@ func isIKEInitRetryableErrorForProfile(err error, prof carrier.EffectiveCarrierC
 	return false
 }
 
-// filterProposalsByDHGroup 从 SA 中过滤出匹配指定 DH group 的提议。
+// filterProposalsByDHGroup 从 SA 中过滤出匹配指定 DH group 的提议，并按 RFC 7296 §3.3
+// 从 1 连续重编号（ePDG 对跳号提案可能直接拒绝或静默丢包）。
 // 每个 proposal 的 Transforms 中必须包含 TransformDHRGroup 且 ID 匹配 dhGroup。
 func filterProposalsByDHGroup(sa ikev2.SecurityAssociation, dhGroup uint16) ikev2.SecurityAssociation {
 	var filtered []ikev2.Proposal
@@ -401,6 +449,9 @@ func filterProposalsByDHGroup(sa ikev2.SecurityAssociation, dhGroup uint16) ikev
 		if matched {
 			filtered = append(filtered, p)
 		}
+	}
+	for i := range filtered {
+		filtered[i].Number = uint8(i + 1)
 	}
 	return ikev2.SecurityAssociation{Proposals: filtered}
 }
@@ -444,14 +495,14 @@ func (m *IKEPacketTunnelManager) updateReauthenticationState(auth ikev2.FullAuth
 	}
 }
 
-func (m *IKEPacketTunnelManager) transportConfigs(cfg TunnelConfig, epdg string) (IKETransportConfig, ESPTransportConfig) {
+func (m *IKEPacketTunnelManager) transportConfigs(ctx context.Context, cfg TunnelConfig, epdg string) (IKETransportConfig, ESPTransportConfig) {
 	remotePort := m.Config.RemotePort
 	if remotePort == 0 {
 		remotePort = 500 // IKE 标准端口；NAT-T (4500) 在检测到 NAT 后切换
 	}
 	localPort := m.Config.LocalPort
 	if localPort == 0 {
-		localPort = 500 // IKE 标准端口；NAT-D 载荷需要非零端口
+		localPort = 500 // IKE 标准端口；NAT-D 载荷需要非零端口才会生成
 	}
 	localIP := normalizedMOBIKEIP(m.Config.LocalIP, cfg.OuterLocalIP)
 	remoteIP := normalizedMOBIKEIP(m.Config.RemoteIP, tunnelAddressHost(epdg))
@@ -459,18 +510,18 @@ func (m *IKEPacketTunnelManager) transportConfigs(cfg TunnelConfig, epdg string)
 	if localIP == nil {
 		localIP = defaultLocalIP()
 	}
-// 当 ePDG 是域名时，在本地解析到 IP 再传递给传输层（SOCKS5 代理的 DNS 可能无法解析 3gppnetwork.org 域）
+	// 当 ePDG 是域名时，在本地解析到 IP 再传递给传输层（SOCKS5 代理的 DNS 可能无法解析 3gppnetwork.org 域）
 	// 同时收集所有 A 记录，SOCKS5 传输层会依次尝试。
+	// 解析链（对齐 VoCat）：系统 DNS（含 MNC 2/3 位备选主机名）→ Google DoH + EDNS-Client-Subnet
+	// 就近回退——部分 ePDG 权威 DNS 只给归属国解析器返回地址，本地解析器可能拿到空/次优答案。
 	var remoteAddrs []string
 	if net.ParseIP(tunnelAddressHost(epdg)) == nil {
-		if ips, err := net.DefaultResolver.LookupIPAddr(context.Background(), tunnelAddressHost(epdg)); err == nil && len(ips) > 0 {
+		if ips, err := resolveEPDGAddresses(ctx, m.Config.EPDGResolver, tunnelAddressHost(epdg)); err == nil && len(ips) > 0 {
 			remoteAddrs = make([]string, 0, len(ips))
 			for _, ip := range ips {
-				if ip.IP != nil {
-					remoteAddrs = append(remoteAddrs, tunnelUDPAddr(ip.IP.String(), remotePort))
-				}
+				remoteAddrs = append(remoteAddrs, tunnelUDPAddr(ip.String(), remotePort))
 			}
-			epdg = ips[0].IP.String()
+			epdg = ips[0].String()
 			remoteIP = normalizedMOBIKEIP(nil, epdg)
 		}
 	}
@@ -493,25 +544,25 @@ func (m *IKEPacketTunnelManager) transportConfigs(cfg TunnelConfig, epdg string)
 	if !useMarker {
 		useMarker = remotePort == 4500
 	}
-ikeCfg := IKETransportConfig{
-			EPDGAddress:     epdg,
-			RemoteAddr:      remoteAddr,
-			RemoteAddrs:     remoteAddrs,
-			LocalAddr:       localAddr,
-			LocalIP:         localIP,
-			RemoteIP:        remoteIP,
-			LocalPort:       localPort,
-			RemotePort:      remotePort,
-			Timeout:         timeout,
-			UseNonESPMarker: useMarker,
-		}
-		espCfg := ESPTransportConfig{
-			EPDGAddress: epdg,
-			RemoteAddr:  remoteAddr,
-			RemoteAddrs: remoteAddrs,
-			LocalAddr:   localAddr,
-			Timeout:     timeout,
-		}
+	ikeCfg := IKETransportConfig{
+		EPDGAddress:     epdg,
+		RemoteAddr:      remoteAddr,
+		RemoteAddrs:     remoteAddrs,
+		LocalAddr:       localAddr,
+		LocalIP:         localIP,
+		RemoteIP:        remoteIP,
+		LocalPort:       localPort,
+		RemotePort:      remotePort,
+		Timeout:         timeout,
+		UseNonESPMarker: useMarker,
+	}
+	espCfg := ESPTransportConfig{
+		EPDGAddress: epdg,
+		RemoteAddr:  remoteAddr,
+		RemoteAddrs: remoteAddrs,
+		LocalAddr:   localAddr,
+		Timeout:     timeout,
+	}
 	return ikeCfg, espCfg
 }
 
@@ -581,9 +632,9 @@ func (m *IKEPacketTunnelManager) childSPI(random io.Reader) ([]byte, error) {
 	return spi, nil
 }
 
-func (m *IKEPacketTunnelManager) controlHandlers(transport ikev2.InitTransport, init ikev2.InitResult, auth ikev2.FullAuthResult, child ikev2.ChildSAResult, result TunnelResult, transportCfg IKETransportConfig) (func(context.Context) error, func(context.Context, MOBIKERequest) (MOBIKEResult, error)) {
+func (m *IKEPacketTunnelManager) controlHandlers(transport ikev2.InitTransport, init ikev2.InitResult, auth ikev2.FullAuthResult, child ikev2.ChildSAResult, result TunnelResult, transportCfg IKETransportConfig) (func(context.Context) error, func(context.Context, MOBIKERequest) (MOBIKEResult, error), func(context.Context) error) {
 	if m.Config.DisableControlPlaneHooks || auth.NextMessageID == 0 || !ikeKeysUsable(init.Keys) {
-		return nil, nil
+		return nil, nil, nil
 	}
 	control := &ikePacketTunnelControl{
 		transport:             transport,
@@ -601,11 +652,12 @@ func (m *IKEPacketTunnelManager) controlHandlers(transport ikev2.InitTransport, 
 		random:                m.Config.Random,
 	}
 	closeHandler := control.close
+	livenessHandler := control.liveness
 	var mobikeHandler func(context.Context, MOBIKERequest) (MOBIKEResult, error)
 	if init.MOBIKESupported {
 		mobikeHandler = control.mobike
 	}
-	return closeHandler, mobikeHandler
+	return closeHandler, mobikeHandler, livenessHandler
 }
 
 type ikePacketTunnelControl struct {
@@ -623,6 +675,24 @@ type ikePacketTunnelControl struct {
 	additionalAddresses   []net.IP
 	noAdditionalAddresses bool
 	random                io.Reader
+}
+
+func (c *ikePacketTunnelControl) liveness(ctx context.Context) error {
+	if c == nil {
+		return ErrInvalidIKEControl
+	}
+	c.mu.Lock()
+	messageID := c.nextMessageID
+	c.nextMessageID++
+	c.mu.Unlock()
+	_, err := ikev2.RunLivenessCheck(ctx, ikev2.InformationalConfig{
+		Transport: c.transport,
+		Init:      c.init,
+		Keys:      c.keys,
+		MessageID: messageID,
+		Random:    c.random,
+	})
+	return err
 }
 
 func (c *ikePacketTunnelControl) close(ctx context.Context) error {
@@ -703,6 +773,7 @@ func tunnelResultFromIKE(cfg TunnelConfig, epdg string, init ikev2.InitResult, c
 		LocalInnerIP:      firstPacketNonEmpty(cfg.InnerLocalIP, childConfigurationAddress(child, ikev2.ConfigInternalIPv4Address), childConfigurationAddress(child, ikev2.ConfigInternalIPv6Address)),
 		RemoteInnerIP:     strings.TrimSpace(cfg.RemoteInnerIP),
 		DNSServers:        childConfigurationDNS(child),
+		PSCFAddress:       childConfigurationPSCF(child),
 		IKEEstablished:    true,
 		IPsecEstablished:  true,
 		MOBIKESupported:   init.MOBIKESupported,
@@ -724,15 +795,28 @@ func childConfigurationDNS(child ikev2.ChildSAResult) []string {
 	return append(childConfigurationIPStrings(child, ikev2.ConfigInternalIPv4DNS), childConfigurationIPStrings(child, ikev2.ConfigInternalIPv6DNS)...)
 }
 
+// childConfigurationPSCF 提取 P-CSCF 地址；v6 优先（vowifi_gateway 行为），无 v6 用 v4。
+func childConfigurationPSCF(child ikev2.ChildSAResult) string {
+	v6 := childConfigurationIPStrings(child, ikev2.ConfigInternalIPv6Pcscf)
+	if len(v6) > 0 {
+		return v6[0]
+	}
+	v4 := childConfigurationIPStrings(child, ikev2.ConfigInternalIPv4Pcscf)
+	if len(v4) > 0 {
+		return v4[0]
+	}
+	return ""
+}
+
 func childConfigurationIPStrings(child ikev2.ChildSAResult, attrType uint16) []string {
 	if child.Configuration == nil {
 		return nil
 	}
 	width := 0
 	switch attrType {
-	case ikev2.ConfigInternalIPv4Address, ikev2.ConfigInternalIPv4DNS:
+	case ikev2.ConfigInternalIPv4Address, ikev2.ConfigInternalIPv4DNS, ikev2.ConfigInternalIPv4Pcscf:
 		width = net.IPv4len
-	case ikev2.ConfigInternalIPv6Address, ikev2.ConfigInternalIPv6DNS:
+	case ikev2.ConfigInternalIPv6Address, ikev2.ConfigInternalIPv6DNS, ikev2.ConfigInternalIPv6Pcscf:
 		width = net.IPv6len
 	default:
 		return nil
@@ -778,14 +862,45 @@ func epdgAddressForTunnel(cfg TunnelConfig) string {
 	return fmt.Sprintf("epdg.epc.mnc%s.mcc%s.pub.3gppnetwork.org", leftPadTunnel(mnc, 3), mcc)
 }
 
+// defaultAPNForAuth 是 IKE_AUTH IDr 用的默认 APN（ID_FQDN），
+// 对齐 vowifi_gateway 的 SWU_IDR_MODE=apn 默认值。
+const defaultAPNForAuth = "ims"
+
+// cpModeForProfile 把 carrier CP profile 映射到 CFG 请求的地址族。
+func cpModeForProfile(prof carrier.EffectiveCarrierConfig) string {
+	mode := prof.CP.EffectiveCPMode()
+	switch mode {
+	case "v4", "v6", "dual":
+		return mode
+	default:
+		// auto 首选 v4（Vodafone UK 实测 v6 请求被 16375 拒）。
+		return "v4"
+	}
+}
+
+// eapIdentityForTunnel 构造 EAP-AKA 永久身份（TS 23.003 §19.3.2）。
+// 优先级刻意为 IMSI > 显式覆盖 > IMPI：ePDG/AAA 路由的是 IMSI 永久 NAI，
+// ISIM 的 IMPI（ims. 域）只属于 IMS SIP 层，进 IKE/EAP 会被多数 ePDG 拒绝
+// （vowifi_gateway 对照：身份永远用 0<IMSI>@nai.epc.mnc…，MK 派生同此字符串）。
 func eapIdentityForTunnel(cfg TunnelConfig, override string) (string, error) {
-	raw := firstPacketNonEmpty(override, cfg.Identity.IMPI, cfg.IMSI, cfg.Identity.IMPU)
+	raw := firstPacketNonEmpty(cfg.IMSI, override, cfg.Identity.IMPI, cfg.Identity.IMPU)
 	if raw == "" {
 		return "", fmt.Errorf("%w: EAP identity is empty", ErrInvalidTunnelConfig)
 	}
 	raw = normalizeTunnelIdentity(raw)
 	if strings.Contains(raw, "@") {
-		return raw, nil
+		// 带 @ 的显式身份仅当 override 明确提供时才透传；IMPI/IMPU 派生的
+		// ims. 域身份不透传，回落到 IMSI 拼永久 NAI。
+		if strings.TrimSpace(override) != "" && raw == strings.TrimSpace(normalizeTunnelIdentity(override)) {
+			return raw, nil
+		}
+		if imsi := strings.TrimSpace(cfg.IMSI); imsi != "" && strings.Contains(raw, imsi) {
+			return raw, nil
+		}
+		if cfg.IMSI == "" {
+			return raw, nil
+		}
+		raw = cfg.IMSI
 	}
 	mcc, mnc := tunnelMCCMNC(cfg)
 	if mcc == "" || mnc == "" {
@@ -929,10 +1044,10 @@ func comprehensiveIKEProposal() ikev2.SecurityAssociation {
 		return ikev2.Proposal{Number: num, ProtocolID: ikev2.ProtocolIKE, Transforms: []ikev2.Transform{encr, integ, prf, dh}}
 	}
 	return ikev2.SecurityAssociation{Proposals: []ikev2.Proposal{
-		prop(1, ikev2.DHGroup2048BitMODP),        // Proposal 1: AES-128+SHA256+MODP 2048 (匹配 KE)
-		propGroup2(2, false),                      // Proposal 2: AES-128+SHA256+MODP 1024
-		propGroup2(3, true),                       // Proposal 3: AES-128+SHA1+MODP 1024
-		propAES256SHA1Group2(4),                   // Proposal 4: AES-256+SHA1+MODP 1024
+		prop(1, ikev2.DHGroup2048BitMODP), // Proposal 1: AES-128+SHA256+MODP 2048 (匹配 KE)
+		propGroup2(2, false),              // Proposal 2: AES-128+SHA256+MODP 1024
+		propGroup2(3, true),               // Proposal 3: AES-128+SHA1+MODP 1024
+		propAES256SHA1Group2(4),           // Proposal 4: AES-256+SHA1+MODP 1024
 	}}
 }
 

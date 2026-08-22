@@ -30,6 +30,8 @@ type AuthConfig struct {
 	Init             InitResult
 	Keys             IKEKeys
 	InitiatorID      Identity
+	ResponderID      *Identity
+	DeviceIdentity   *DeviceIdentity
 	EAPIdentity      string
 	ChildSA          SecurityAssociation
 	ChildSPI         []byte
@@ -52,6 +54,7 @@ type AuthResult struct {
 	EAPRequest            *eapaka.Packet
 	EAPAfterIdentity      *eapaka.Packet
 	IdentityTranscript    [][]byte
+	DeviceIdentityAnswered *Payload
 	NextMessageID         uint32
 }
 
@@ -106,6 +109,8 @@ type FullAuthConfig struct {
 	SIM                sim.AKAProvider
 	EAPKeys            eapaka.Keys
 	InitiatorID        Identity
+	ResponderID        *Identity
+	DeviceIdentity     *DeviceIdentity
 	EAPIdentity        string
 	EAPReauthIdentity  string
 	EAPReauthCounter   uint16
@@ -122,6 +127,7 @@ type FullAuthConfig struct {
 	InitialMessageID   uint32
 }
 
+// FullAuthResult 增加 AUTH 完成标记与最终交换字节。
 type FullAuthResult struct {
 	Auth                     AuthResult
 	IdentityExchanges        []EAPIdentityExchange
@@ -142,6 +148,9 @@ type FullAuthResult struct {
 	NextMessageID            uint32
 	FinalResponseBytes       []byte
 	FinalResponseInner       []Payload
+	IKEAuthCompleted         bool
+	AuthRequestBytes         []byte
+	AuthResponseBytes        []byte
 }
 
 type EAPIdentityExchange struct {
@@ -220,6 +229,15 @@ func RunIKE_AUTH_EAPIdentity(ctx context.Context, cfg AuthConfig) (AuthResult, e
 	if err != nil {
 		return AuthResult{}, err
 	}
+	if os.Getenv("SWU_DEBUG_IKE") != "" {
+		// 自解密验证：用同一密钥解回自己的密文，确认加密层自洽。
+		if _, inner, derr := UnprotectMessage(append([]byte(nil), initialReqBytes...), keys, true); derr != nil {
+			fmt.Fprintf(os.Stderr, "[swu] IKE_AUTH(1) self-decrypt FAILED: %v\n", derr)
+		} else {
+			fmt.Fprintf(os.Stderr, "[swu] IKE_AUTH(1) self-decrypt ok, inner types=%x\n", payloadTypesHex(inner))
+		}
+		fmt.Fprintf(os.Stderr, "[swu] IKE_AUTH(1) raw (%d bytes): %x\n", len(initialReqBytes), initialReqBytes)
+	}
 	initialRespBytes, err := cfg.Transport.ExchangeIKE(ctx, initialReqBytes)
 	if err != nil {
 		return AuthResult{}, err
@@ -232,6 +250,13 @@ func RunIKE_AUTH_EAPIdentity(ctx context.Context, cfg AuthConfig) (AuthResult, e
 	eapReq, eapReqRaw, hasEAP, err := firstEAPPacketWithRaw(initialInnerResp)
 	if err != nil {
 		return AuthResult{}, err
+	}
+	// ePDG 可能直接在首条响应里拒绝（无 EAP payload，仅错误 NOTIFY）——
+	// 这正是 86 字节响应的场景，必须把拒绝理由带出来。
+	if !hasEAP {
+		if notifyErr := authNotifyError(initialInnerResp); notifyErr != nil {
+			return AuthResult{}, notifyErr
+		}
 	}
 	out := AuthResult{
 		InitialRequestBytes:  append([]byte(nil), initialReqBytes...),
@@ -264,11 +289,18 @@ func RunIKE_AUTH_EAPIdentity(ctx context.Context, cfg AuthConfig) (AuthResult, e
 	if err != nil {
 		return AuthResult{}, err
 	}
+	// ePDG 在首条响应里请求 DEVICE_IDENTITY 时，按 TS 24.302 §7.2.6 在下一条
+	// 消息（EAP-Response/Identity）里附带应答（vowifi_gateway create_IKE_AUTH_2）。
+	out.DeviceIdentityAnswered = answerDeviceIdentityRequest(initialInnerResp, cfg.DeviceIdentity)
 	identityIV, err := authIV(cfg.Random, keys.Profile, cfg.EAPIdentityIV)
 	if err != nil {
 		return AuthResult{}, err
 	}
-	_, identityReqBytes, err := ProtectMessage(authHeader(cfg.Init, messageID+1, true), keys, true, []Payload{EAPPayload(identityPacket)}, identityIV)
+	identityPayloads := []Payload{EAPPayload(identityPacket)}
+	if out.DeviceIdentityAnswered != nil {
+		identityPayloads = append(identityPayloads, *out.DeviceIdentityAnswered)
+	}
+	_, identityReqBytes, err := ProtectMessage(authHeader(cfg.Init, messageID+1, true), keys, true, identityPayloads, identityIV)
 	if err != nil {
 		return AuthResult{}, err
 	}
@@ -281,6 +313,14 @@ func RunIKE_AUTH_EAPIdentity(ctx context.Context, cfg AuthConfig) (AuthResult, e
 		return AuthResult{}, err
 	}
 	dumpAuthPayloadTypes("IKE_AUTH identity response", identityInnerResp)
+	// 回完身份后 ePDG 若直接拒绝（无后续 EAP），同样要把 NOTIFY 理由带出来。
+	if _, ok, err := firstEAPPacket(identityInnerResp); err != nil {
+		return AuthResult{}, err
+	} else if !ok {
+		if notifyErr := authNotifyError(identityInnerResp); notifyErr != nil {
+			return AuthResult{}, notifyErr
+		}
+	}
 	out.IdentityRequestBytes = append([]byte(nil), identityReqBytes...)
 	out.IdentityResponseBytes = append([]byte(nil), identityRespBytes...)
 	out.IdentityResponseInner = clonePayloads(identityInnerResp)
@@ -304,6 +344,8 @@ func RunIKE_AUTH_Full(ctx context.Context, cfg FullAuthConfig) (FullAuthResult, 
 		Init:             cfg.Init,
 		Keys:             cfg.Keys,
 		InitiatorID:      cfg.InitiatorID,
+		ResponderID:      cfg.ResponderID,
+		DeviceIdentity:   cfg.DeviceIdentity,
 		EAPIdentity:      cfg.EAPIdentity,
 		ChildSA:          cfg.ChildSA,
 		ChildSPI:         localChildSPI,
@@ -338,19 +380,17 @@ func RunIKE_AUTH_Full(ctx context.Context, cfg FullAuthConfig) (FullAuthResult, 
 		identity = strings.TrimSpace(string(cfg.InitiatorID.Data))
 	}
 	identityTranscript := cloneByteSlices(auth.IdentityTranscript)
+	keys := cfg.Keys
+	if keys.Profile.RequiredLength() == 0 {
+		keys = cfg.Init.Keys
+	}
 	for i := 0; i < maxFullAuthEAPExchanges; i++ {
 		if next == nil {
 			return out, fmt.Errorf("%w: IKE_AUTH did not complete EAP", ErrInvalidAuthResponse)
 		}
 		out.EAPLast = cloneEAPPacketPtr(next)
 		if next.Code == eapaka.CodeSuccess {
-			if child, ok, err := parseChildSAIfPresent(cfg.Init, out.FinalResponseInner, localChildSPI, out.NextMessageID); err != nil {
-				return FullAuthResult{}, err
-			} else if ok {
-				out.ChildSA = &child
-				return out, nil
-			}
-			return out, fmt.Errorf("%w: EAP success without CHILD_SA", ErrInvalidAuthResponse)
+			return completeIKEAuthWithAUTH(ctx, cfg, out, keys, localChildSPI)
 		}
 		if next.Code == eapaka.CodeFailure {
 			return out, fmt.Errorf("%w: EAP failure", ErrInvalidAuthResponse)
@@ -443,6 +483,16 @@ func RunIKE_AUTH_Full(ctx context.Context, cfg FullAuthConfig) (FullAuthResult, 
 			out.ChildSA = &child
 			if challenge.EAPNext != nil {
 				out.EAPLast = cloneEAPPacketPtr(challenge.EAPNext)
+			}
+			// ePDG 把 EAP-Success 与 CP/SA 合并在最后一条响应时，CHILD_SA 已就绪，
+			// 但 RFC 7296 §2.16 的第四条 AUTH 消息仍必须补发（部分 ePDG 不等它就
+			// 下发流量，也有严格实现等它才激活 SA）。补发失败不推翻已建立的 SA。
+			if out.EAPLast != nil && out.EAPLast.Code == eapaka.CodeSuccess && !out.IKEAuthCompleted {
+				completed, authErr := completeIKEAuthWithAUTH(ctx, cfg, out, keys, localChildSPI)
+				if authErr == nil {
+					return completed, nil
+				}
+				fmt.Fprintf(os.Stderr, "[swu] post-success AUTH exchange failed (%v), keeping CHILD_SA from EAP-Success response\n", authErr)
 			}
 			return out, nil
 		}
@@ -821,6 +871,15 @@ func BuildIKEAuthInitialPayloads(cfg AuthConfig) ([]Payload, error) {
 	if err != nil {
 		return nil, err
 	}
+	payloads := []Payload{idPayload}
+	// IDr：对齐 vowifi_gateway（swu_ike.py L3492-3495），默认发裸 APN 的 ID_FQDN。
+	if cfg.ResponderID != nil {
+		idrPayload, err := IdentityPayload(PayloadIDr, *cfg.ResponderID)
+		if err != nil {
+			return nil, err
+		}
+		payloads = append(payloads, idrPayload)
+	}
 	childSA := cfg.ChildSA
 	if len(childSA.Proposals) == 0 {
 		spi := append([]byte(nil), cfg.ChildSPI...)
@@ -844,9 +903,6 @@ func BuildIKEAuthInitialPayloads(cfg AuthConfig) ([]Payload, error) {
 	if err != nil {
 		return nil, err
 	}
-	// 调试日志：打印 CHILD_SA 的完整字节
-	saBody, _ := childSA.MarshalBinary()
-	fmt.Fprintf(os.Stderr, "[swu] CHILD_SA proposal (%d proposals, %d bytes): %x\n", len(childSA.Proposals), len(saBody), saBody)
 	tsi := cfg.TSi
 	if len(tsi.Selectors) == 0 {
 		tsi = IPv4AnyTrafficSelectors()
@@ -867,8 +923,18 @@ func BuildIKEAuthInitialPayloads(cfg AuthConfig) ([]Payload, error) {
 	if err != nil {
 		return nil, err
 	}
-	payloads := []Payload{idPayload, cfgPayload, saPayload, tsiPayload, tsrPayload}
+	payloads = append(payloads, cfgPayload, saPayload, tsiPayload, tsrPayload)
+	// INITIAL_CONTACT：让 ePDG 清掉本 IDi 的旧 SA（vowifi_gateway 行为）。
+	payloads = append(payloads, InitialContactNotify())
+	// MOBIKE_SUPPORTED：能力声明（对齐 VoCat/Android；ePDG 回应与否都无害）。
+	payloads = append(payloads, MOBIKESupportedNotify())
+	// DEVICE_IDENTITY 不主动发：vowifi_gateway 只在 ePDG 请求后在 EAP 响应里应答，
+	// 主动塞进首条 IKE_AUTH 会被部分 ePDG 视为非法 notify 而静默丢包。
+	// EAP_ONLY_AUTHENTICATION（RFC 5998）：EAP 模式必选收尾通知。
+	payloads = append(payloads, EAPOnlyAuthenticationNotify())
 	if os.Getenv("SWU_DEBUG_AUTH") != "" {
+		saBody, _ := childSA.MarshalBinary()
+		fmt.Fprintf(os.Stderr, "[swu] CHILD_SA proposal (%d proposals, %d bytes): %x\n", len(childSA.Proposals), len(saBody), saBody)
 		var sizes []int
 		for _, p := range payloads {
 			sizes = append(sizes, len(p.Body)+4)
@@ -902,17 +968,157 @@ func authHeader(init InitResult, messageID uint32, fromInitiator bool) Header {
 	}
 }
 
+// computeInitiatorAUTH 计算 RFC 7296 §2.15 的 EAP 模式 AUTH payload：
+//
+//	AUTH = prf(prf(MSK, "Key Pad for IKEv2"), <msg octets>)
+//	<msg octets> = IKE_SA_INIT 请求原始字节 ‖ Nr ‖ prf(SK_pi, IDi')
+//
+// IDi' 是 IDi payload 的编码体（含类型字节 + 3 保留字节）。
+// 方法字节 = 2（SHARED_KEY_MESSAGE_INTEGRITY_CODE）。
+func computeInitiatorAUTH(init InitResult, keys IKEKeys, id Identity, msk []byte) (Payload, error) {
+	if len(msk) == 0 {
+		return Payload{}, fmt.Errorf("%w: MSK is empty for AUTH computation", ErrInvalidAuthConfig)
+	}
+	if len(keys.SKPi) == 0 {
+		return Payload{}, fmt.Errorf("%w: SK_pi is empty for AUTH computation", ErrInvalidAuthConfig)
+	}
+	if len(init.RequestBytes) == 0 || len(init.NonceR) == 0 {
+		return Payload{}, fmt.Errorf("%w: SA_INIT transcript unavailable for AUTH computation", ErrInvalidAuthConfig)
+	}
+	idEncoded, err := id.MarshalBinary()
+	if err != nil {
+		return Payload{}, err
+	}
+	prfHash := keys.Profile.PRF
+	signedIDi, err := PRF(prfHash, keys.SKPi, idEncoded)
+	if err != nil {
+		return Payload{}, err
+	}
+	keyPad := []byte("Key Pad for IKEv2")
+	authKey, err := PRF(prfHash, msk, keyPad)
+	if err != nil {
+		return Payload{}, err
+	}
+	msgOctets := make([]byte, 0, len(init.RequestBytes)+len(init.NonceR)+len(signedIDi))
+	msgOctets = append(msgOctets, init.RequestBytes...)
+	msgOctets = append(msgOctets, init.NonceR...)
+	msgOctets = append(msgOctets, signedIDi...)
+	authData, err := PRF(prfHash, authKey, msgOctets)
+	if err != nil {
+		return Payload{}, err
+	}
+	body := make([]byte, 4, 4+len(authData))
+	body[0] = 2 // SHARED_KEY_MESSAGE_INTEGRITY_CODE
+	body = append(body, authData...)
+	return Payload{Type: PayloadAUTH, Body: body}, nil
+}
+
 func unprotectAuthResponse(raw []byte, init InitResult, keys IKEKeys, messageID uint32) (Message, []Payload, error) {
 	msg, inner, err := UnprotectMessage(raw, keys, false)
 	if err != nil {
+		if os.Getenv("SWU_DEBUG_AUTH") != "" || os.Getenv("SWU_DEBUG_IKE") != "" {
+			dumpLen := len(raw)
+			if dumpLen > 96 {
+				dumpLen = 96
+			}
+			fmt.Fprintf(os.Stderr, "[swu] unprotectAuthResponse failed (want msgid=%d, got %d bytes): %x\n", messageID, len(raw), raw[:dumpLen])
+		}
 		return Message{}, nil, err
 	}
 	h := msg.Header
 	if h.InitiatorSPI != init.InitiatorSPI || h.ResponderSPI != init.ResponderSPI ||
 		h.ExchangeType != ExchangeIKE_AUTH || h.MessageID != messageID || h.Flags&FlagResponse == 0 {
+		if os.Getenv("SWU_DEBUG_AUTH") != "" || os.Getenv("SWU_DEBUG_IKE") != "" {
+			fmt.Fprintf(os.Stderr, "[swu] IKE_AUTH response header mismatch: got SPIi=%x SPIr=%x exch=%d mid=%d flags=%#x, want SPIi=%x mid=%d\n",
+				h.InitiatorSPI, h.ResponderSPI, h.ExchangeType, h.MessageID, h.Flags, init.InitiatorSPI, messageID)
+		}
 		return Message{}, nil, fmt.Errorf("%w: unexpected IKE_AUTH response header", ErrInvalidAuthResponse)
 	}
 	return msg, inner, nil
+}
+
+// authNotifyError 扫描 IKE_AUTH 响应内层 payload 里的错误 NOTIFY，
+// 让 ePDG 的拒绝理由（AUTHENTICATION_FAILED / FAILED_CP_REQUIRED / 3GPP 9000 段 /
+// Vodafone 16375 等）直接浮出，而不是笼统的 "did not complete EAP"。
+func authNotifyError(inner []Payload) error {
+	for _, p := range inner {
+		if p.Type != PayloadNotify {
+			continue
+		}
+		notify, err := ParseNotify(p.Body)
+		if err != nil {
+			return err
+		}
+		if err := NotifyErrorFor(notify); err != nil {
+			fmt.Fprintf(os.Stderr, "[swu] IKE_AUTH rejected by notify %s (type=%d data=%x)\n",
+				NotifyTypeName(notify.NotifyType), notify.NotifyType, notify.NotificationData)
+			return err
+		}
+	}
+	return nil
+}
+
+// authDeviceIdentityRequest 检查 ePDG 是否在响应里请求了 DEVICE_IDENTITY。
+func authDeviceIdentityRequest(inner []Payload) (byte, bool) {
+	for _, p := range inner {
+		if p.Type != PayloadNotify {
+			continue
+		}
+		notify, err := ParseNotify(p.Body)
+		if err != nil || notify.NotifyType != NotifyDeviceIdentity {
+			continue
+		}
+		reqType, _, err := ParseDeviceIdentityRequest(notify)
+		if err == nil {
+			return reqType, true
+		}
+		return DeviceIdentityTypeIMEI, true
+	}
+	return 0, false
+}
+
+// deviceIdentityForRequest 按请求类型选出 IMEI/IMEISV 值。
+func deviceIdentityForRequest(imei, imeisv string, reqType byte) (DeviceIdentity, error) {
+	imei = strings.TrimSpace(imei)
+	imeisv = strings.TrimSpace(imeisv)
+	if reqType == DeviceIdentityTypeIMEISV {
+		if imeisv == "" && len(imei) == 15 {
+			imeisv = imei[:14] + "0" + imei[14:] // IMEI + 2 位软件版本兜底
+			if len(imeisv) != 16 {
+				imeisv = imei + "00"
+			}
+		}
+		if len(imeisv) != 16 {
+			return DeviceIdentity{}, fmt.Errorf("%w: IMEISV unavailable for DEVICE_IDENTITY", ErrInvalidAuthConfig)
+		}
+		return DeviceIdentity{IdentityType: DeviceIdentityTypeIMEISV, Value: imeisv}, nil
+	}
+	if len(imei) != 15 {
+		return DeviceIdentity{}, fmt.Errorf("%w: IMEI unavailable for DEVICE_IDENTITY", ErrInvalidAuthConfig)
+	}
+	return DeviceIdentity{IdentityType: DeviceIdentityTypeIMEI, Value: imei}, nil
+}
+
+// answerDeviceIdentityRequest 在 ePDG 请求 DEVICE_IDENTITY 且本地有可用
+// IMEI/IMEISV 时构造应答 notify payload；未请求或不可用时返回 nil（不发送）。
+func answerDeviceIdentityRequest(inner []Payload, identity *DeviceIdentity) *Payload {
+	if identity == nil {
+		return nil
+	}
+	reqType, requested := authDeviceIdentityRequest(inner)
+	if !requested {
+		return nil
+	}
+	dev, err := deviceIdentityForRequest(identity.Value, "", reqType)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[swu] DEVICE_IDENTITY request with type %d cannot be answered: %v\n", reqType, err)
+		return nil
+	}
+	payload, err := DeviceIdentityNotify(dev)
+	if err != nil {
+		return nil
+	}
+	return &payload
 }
 
 func firstEAPPacket(payloads []Payload) (eapaka.Packet, bool, error) {
@@ -966,8 +1172,51 @@ func parseChildSAIfPresent(init InitResult, inner []Payload, localSPI []byte, ne
 	return child, true, nil
 }
 
-func fullAuthLocalChildSPI(cfg FullAuthConfig) ([]byte, error) {
-	if len(cfg.ChildSA.Proposals) > 0 && len(cfg.ChildSA.Proposals[0].SPI) > 0 {
+// completeIKEAuthWithAUTH 完成 RFC 7296 §2.16 EAP 流程的第四条消息：
+// 发起方发送仅含 AUTH payload 的 IKE_AUTH 请求，ePDG 应回 CP/SA（CHILD_SA 协商结果）。
+// AUTH = prf(prf(MSK, "Key Pad for IKEv2"), IKE_SA_INIT 请求 ‖ Nr ‖ prf(SK_PI, IDi'))。
+func completeIKEAuthWithAUTH(ctx context.Context, cfg FullAuthConfig, out FullAuthResult, keys IKEKeys, localChildSPI []byte) (FullAuthResult, error) {
+	authPayload, err := computeInitiatorAUTH(cfg.Init, keys, cfg.InitiatorID, out.EAPKeys.MSK)
+	if err != nil {
+		return FullAuthResult{}, err
+	}
+	iv, err := authIV(cfg.Random, keys.Profile, nil)
+	if err != nil {
+		return FullAuthResult{}, err
+	}
+	authMessageID := out.NextMessageID
+	_, authReqBytes, err := ProtectMessage(authHeader(cfg.Init, authMessageID, true), keys, true, []Payload{authPayload}, iv)
+	if err != nil {
+		return FullAuthResult{}, err
+	}
+	authRespBytes, err := cfg.Transport.ExchangeIKE(ctx, authReqBytes)
+	if err != nil {
+		return FullAuthResult{}, fmt.Errorf("IKE_AUTH final exchange failed: %w", err)
+	}
+	_, authInner, err := unprotectAuthResponse(authRespBytes, cfg.Init, keys, authMessageID)
+	if err != nil {
+		return FullAuthResult{}, err
+	}
+	dumpAuthPayloadTypes("IKE_AUTH final AUTH response", authInner)
+	if notifyErr := authNotifyError(authInner); notifyErr != nil {
+		return FullAuthResult{}, notifyErr
+	}
+	out.IKEAuthCompleted = true
+	out.AuthRequestBytes = append([]byte(nil), authReqBytes...)
+	out.AuthResponseBytes = append([]byte(nil), authRespBytes...)
+	out.FinalResponseBytes = append([]byte(nil), authRespBytes...)
+	out.FinalResponseInner = clonePayloads(authInner)
+	out.NextMessageID = authMessageID + 1
+	if child, ok, err := parseChildSAIfPresent(cfg.Init, authInner, localChildSPI, out.NextMessageID); err != nil {
+		return FullAuthResult{}, err
+	} else if ok {
+		out.ChildSA = &child
+		return out, nil
+	}
+	return out, fmt.Errorf("%w: EAP success without CHILD_SA", ErrInvalidAuthResponse)
+}
+
+func fullAuthLocalChildSPI(cfg FullAuthConfig) ([]byte, error) {	if len(cfg.ChildSA.Proposals) > 0 && len(cfg.ChildSA.Proposals[0].SPI) > 0 {
 		return append([]byte(nil), cfg.ChildSA.Proposals[0].SPI...), nil
 	}
 	if len(cfg.ChildSPI) > 0 {
@@ -1075,4 +1324,12 @@ func hasPayload(payloads []Payload, payloadType uint8) bool {
 		}
 	}
 	return false
+}
+
+func payloadTypesHex(payloads []Payload) []byte {
+	out := make([]byte, len(payloads))
+	for i, p := range payloads {
+		out[i] = p.Type
+	}
+	return out
 }
