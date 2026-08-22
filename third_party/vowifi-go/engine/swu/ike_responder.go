@@ -202,9 +202,7 @@ func (r *IKEResponder) HandleInbound(ctx context.Context, packet []byte) bool {
 	case hasDelete:
 		// ePDG 拆 SA：回 ACK（空 INFORMATIONAL 响应）后通知上层重建。
 		// 回 ACK 失败也要通知——SA 已死，重建是唯一出路。
-		if os.Getenv("SWU_DEBUG_IKE") != "" {
-			fmt.Fprintf(os.Stderr, "[swu] IKE responder: DELETE received, ack + rebuild\n")
-		}
+		logEvent("WARN", "收到 ePDG DELETE 通知，SA 被对端拆除", map[string]string{"msgid": fmt.Sprintf("%d", header.MessageID)})
 		replyInner = nil
 		_ = r.sendResponse(send, header.MessageID, replyInner)
 		if onDelete != nil {

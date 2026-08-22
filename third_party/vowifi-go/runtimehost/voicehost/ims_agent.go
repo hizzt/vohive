@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/iniwex5/vowifi-go/runtimehost/voiceclient"
 )
@@ -293,6 +294,53 @@ func (a *IMSOutboundAgent) EndVoiceCall(ctx context.Context, info DialogInfo) er
 	a.mu.Lock()
 	delete(a.dialogs, callID)
 	a.mu.Unlock()
+	return nil
+}
+
+// SendKeepaliveOptions 发一条 dialog 外 SIP OPTIONS（对端=注册公共身份）。
+// 用途：会话空闲期维持经 ESP 隧道的双向 SIP 业务流——设备对照实证（112+
+// 伦敦 SOCKS5，2026-08-22）：v1.5.5 靠周期 SIP 事务在 relay 差时段存活
+// 35min+，而纯 IKE DPD 的会话 7.5-8min 被回收；OPTIONS 是最轻的 SIP 事务
+// （无 body、任何 IMS 网元都会应答 200/4xx）。失败只返回错误，不触发重注册
+// （链路死活由 ESP liveness 判定，避免双系统误杀）。
+func (a *IMSOutboundAgent) SendKeepaliveOptions(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	a.mu.Lock()
+	if a == nil || a.Transport == nil {
+		a.mu.Unlock()
+		return ErrIMSVoiceAgentNotReady
+	}
+	transport := a.Transport
+	cfg := voiceclient.DialogRequestConfig{
+		Profile:         a.Profile,
+		Registration:    a.Registration,
+		LocalURI:        firstVoiceNonEmpty(a.Registration.PublicIdentity, a.Profile.IMPU),
+		ContactURI:      a.Registration.ContactURI,
+		RemoteURI:       firstVoiceNonEmpty(a.Registration.PublicIdentity, a.Profile.IMPU),
+		CallID:          fmt.Sprintf("keepalive-%d", time.Now().UnixNano()),
+		LocalTag:        firstVoiceNonEmpty(a.LocalTag, "vowifi-go"),
+		CSeq:            1,
+		RouteSet:        append([]string(nil), a.Registration.ServiceRoutes...),
+		UserAgent:       firstVoiceNonEmpty(a.UserAgent, a.Profile.UserAgent, "vowifi-go"),
+	}
+	a.mu.Unlock()
+	if strings.TrimSpace(cfg.RemoteURI) == "" {
+		return ErrIMSVoiceAgentNotReady
+	}
+	options, err := voiceclient.BuildOptionsRequest(cfg)
+	if err != nil {
+		return err
+	}
+	resp, err := transport.RoundTripRequest(ctx, options)
+	if err != nil {
+		return err
+	}
+	// 4xx/5xx/6xx 都说明 SIP 链路活着（事务往返完成）——keepalive 目的达成。
+	if resp.StatusCode < 200 {
+		return fmt.Errorf("keepalive OPTIONS provisional response %d", resp.StatusCode)
+	}
 	return nil
 }
 

@@ -320,6 +320,12 @@ func (m *IKEPacketTunnelManager) EstablishTunnel(ctx context.Context, cfg Tunnel
 		}
 		return nil, fmt.Errorf("%w: packet session factory returned nil", ErrInvalidIKETunnelManager)
 	}
+	logEvent("INFO", "IPsec 隧道建立成功", map[string]string{
+		"epdg":        result.EPDGAddress,
+		"inner_ip":    firstPacketNonEmpty(result.LocalInnerIP, "-"),
+		"psc":         firstPacketNonEmpty(result.PSCFAddress, "-"),
+		"child_spi":   result.ChildSAIdentifier,
+	})
 	return session, nil
 }
 

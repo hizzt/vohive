@@ -430,6 +430,7 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 		req.VoiceGateway.RegisterAgent(req.DeviceID, inst)
 	}
 	inst.watchPSCFRestore(ctx, pscfRestoreCh)
+	inst.startSIPKeepaliveLoop(ctx)
 	inst.watchTunnelPump()
 	inst.notify(ctx)
 	return inst, nil
@@ -768,6 +769,67 @@ func (i *Instance) recoverIMSRegistration(ctx context.Context, reason string, up
 	}
 	i.applyIMSRegistrationResult(ctx, result, firstRuntimeNonEmpty(result.Reason, reason, "IMS registration recovered"), updateVoice)
 	return result, true, nil
+}
+
+// sipKeepaliveInterval 是空闲期 SIP OPTIONS 保活间隔。设备对照实证（112+
+// 伦敦 SOCKS5，2026-08-22）：relay 对纯 DPD 流量的会话 ~7.5min 硬回收，但
+// v1.5.5 靠周期 SIP 业务流在同时段存活 35min+——ESP 隧道按业务流量维持。
+// 30s 一条 OPTIONS（无 body 轻事务）复刻该行为；测试可改写缩短周期。
+var sipKeepaliveInterval = 30 * time.Second
+
+// startSIPKeepaliveLoop 周期经 ESP 隧道发 SIP OPTIONS 维持业务流。失败只
+// 记录不动作：链路死活由 ESP liveness(3 次连续失败拆链)统一判定，双系统
+// 各管各的判定权，避免误杀。
+func (i *Instance) startSIPKeepaliveLoop(ctx context.Context) {
+	if i == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	stopped := i.stopCh
+	if stopped == nil {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(sipKeepaliveInterval)
+		defer ticker.Stop()
+		consecutiveFailures := 0
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-stopped:
+				return
+			case <-ticker.C:
+				i.mu.RLock()
+				dead := i.stopped
+				keeper, _ := i.voice.(voicehost.SIPKeepaliveSender)
+				i.mu.RUnlock()
+				if dead || keeper == nil {
+					continue
+				}
+				probeCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+				err := keeper.SendKeepaliveOptions(probeCtx)
+				cancel()
+				if err == nil {
+					consecutiveFailures = 0
+					continue
+				}
+				// ErrIMSVoiceAgentNotReady = agent 尚未就绪（IMS 注册未完
+				// 成等），静默跳过不算失败。
+				if errors.Is(err, voicehost.ErrIMSVoiceAgentNotReady) {
+					continue
+				}
+				consecutiveFailures++
+				// 仅首个失败上报（后续失败静默，避免面板日志刷屏；恢复
+				// 由 liveness 拆链重建兜底）。
+				if consecutiveFailures == 1 {
+					fmt.Fprintf(os.Stderr, "[runtimehost] SIP OPTIONS keepalive failed (%v), muting until recovered\n", err)
+				}
+			}
+		}
+	}()
 }
 
 func (i *Instance) recordIMSRecoveryFailure(ctx context.Context, err error) {

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 	"github.com/iniwex5/vohive/internal/proxy/traffic"
 	"github.com/iniwex5/vohive/internal/sipgw"
 	"github.com/iniwex5/vohive/internal/upstreamproxy"
+	"github.com/iniwex5/vowifi-go/engine/swu"
 	"github.com/iniwex5/vowifi-go/runtimehost/carrier"
 	"github.com/iniwex5/vowifi-go/runtimehost/voicehost"
 
@@ -64,6 +66,22 @@ func main() {
 	})
 	// 将内置 slog 重定向到已就绪的系统日志框架
 	slog.SetDefault(slog.New(logger.NewSlogHandler(logger.ZapLogger())))
+	// swu 引擎层事件（隧道建立/拆链/重建/rekey）接入系统日志——
+	// zap 经 GlobalBroadcaster 推到面板实时日志页。
+	swu.SetEventLogger(swu.EventLoggerFunc(func(level, msg string, fields map[string]string) {
+		args := make([]interface{}, 0, len(fields)*2)
+		for k, v := range fields {
+			args = append(args, k, v)
+		}
+		switch strings.ToUpper(level) {
+		case "ERROR":
+			logger.Error(msg, args...)
+		case "WARN":
+			logger.Warn(msg, args...)
+		default:
+			logger.Info(msg, args...)
+		}
+	}))
 	logger.Info("VoHive 模组管理器启动中...")
 
 	go func() {

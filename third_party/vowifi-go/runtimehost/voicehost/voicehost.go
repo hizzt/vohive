@@ -29,6 +29,12 @@ type OutboundCallAgent interface {
 	StartOutboundCall(context.Context, OutboundCallRequest) (OutboundCallResult, error)
 }
 
+// SIPKeepaliveSender 是可选能力：空闲期周期发 dialog 外 SIP OPTIONS 维持
+// ESP 隧道业务流（IMSOutboundAgent 实现）。
+type SIPKeepaliveSender interface {
+	SendKeepaliveOptions(context.Context) error
+}
+
 type DialogTerminator interface {
 	EndVoiceCall(context.Context, DialogInfo) error
 }

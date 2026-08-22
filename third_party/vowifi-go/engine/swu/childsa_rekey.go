@@ -3,7 +3,6 @@ package swu
 import (
 	"context"
 	"fmt"
-	"os"
 	"time"
 
 	"github.com/iniwex5/vowifi-go/engine/swu/esp"
@@ -75,20 +74,17 @@ func (s *PacketSession) StartRekeyLoop(ctx context.Context) {
 				exchangeCancel()
 				if err != nil {
 					// 保守策略：rekey 失败不动旧 SA（还能跑），下轮再试。
-					if os.Getenv("SWU_DEBUG_IKE") != "" {
-						fmt.Fprintf(os.Stderr, "[swu] CHILD_SA rekey failed (%v), keeping old SA\n", err)
-					}
+					logEvent("WARN", "CHILD_SA rekey 交换失败，保留旧 SA 下轮重试", map[string]string{"error": err.Error()})
 					timer.Reset(childSARekeyInterval)
 					continue
 				}
 				if err := s.ApplyChildSA(child); err != nil {
-					if os.Getenv("SWU_DEBUG_IKE") != "" {
-						fmt.Fprintf(os.Stderr, "[swu] CHILD_SA apply failed (%v), keeping old SA\n", err)
-					}
+					logEvent("WARN", "CHILD_SA 新 SA 应用失败，保留旧 SA 下轮重试", map[string]string{"error": err.Error()})
 					timer.Reset(childSARekeyInterval)
 					continue
 				}
-				fmt.Fprintf(os.Stderr, "[swu] CHILD_SA rekeyed (local spi %x -> %x)\n", s.childSALocalSPI(), child.LocalSPI)
+				logEvent("INFO", "CHILD_SA rekey 成功，ESP SA 已无感切换",
+					map[string]string{"new_spi": fmt.Sprintf("%x", child.LocalSPI)})
 				timer.Reset(childSARekeyInterval)
 			}
 		}

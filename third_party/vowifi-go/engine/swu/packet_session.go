@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -253,11 +252,12 @@ func (s *PacketSession) StartLivenessLoop(ctx context.Context) {
 					continue
 				}
 				consecutiveFailures++
-				fmt.Fprintf(os.Stderr, "[swu] ESP keepalive probe failed (%v), consecutive=%d/%d\n", err, consecutiveFailures, livenessMaxProbeFailures)
+				logEvent("WARN", "ESP 保活探测失败，链路疑似中断",
+					map[string]string{"error": err.Error(), "consecutive": fmt.Sprintf("%d/%d", consecutiveFailures, livenessMaxProbeFailures)})
 				if consecutiveFailures < livenessMaxProbeFailures {
 					continue
 				}
-				fmt.Fprintf(os.Stderr, "[swu] ESP keepalive probe failed %d times, closing session for re-establishment\n", consecutiveFailures)
+				logEvent("ERROR", "ESP 保活连续探测失败，主动拆链等待重建", map[string]string{"failures": fmt.Sprintf("%d", consecutiveFailures)})
 				_ = s.Close(context.Background())
 				return
 			}
