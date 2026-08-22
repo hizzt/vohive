@@ -97,6 +97,11 @@ type PacketSessionConfig struct {
 	// LivenessHandler 是 DPD 探测（INFORMATIONAL 空交换）。设置后
 	// StartLivenessLoop 在空闲期周期探测对端存活，探测失败即关闭会话触发重建。
 	LivenessHandler func(context.Context) error
+	// IKEResponder 应答 ePDG 主动发起的 INFORMATIONAL（DPD 探测/DELETE/
+	// DEVICE_IDENTITY 请求）。nil = 无应答方能力（旧行为：请求被丢弃，
+	// ePDG 在空闲 ~40s 后拆 SA）。设置后 ReadInnerPacket 对入站 IKE 报文
+	// 先经应答方分发，同时刷新 lastInbound（对端有控制流量即存活）。
+	IKEResponder *IKEResponder
 }
 
 // livenessProbeInterval 是 DPD 探测间隔；livenessProbeTimeout 是单次探测超时。
@@ -105,9 +110,12 @@ type PacketSessionConfig struct {
 // DPD 的请求-响应是双向流，可刷新 relay 生命周期。60s 间隔时探测发出前
 // relay 已死，DPD 必超时 → 会话每 ~105s 重建一次；20s 时 DPD 自身成为
 // 维持流。对齐 1.5.5 的周期 SIP 事务（~45s 双向）+ keepalive(20s) 存活模式。
+// livenessMaxProbeFailures 是连续探测失败判死阈值：单次失败即拆链会被
+// 代理偶发丢包误杀（对齐 Python 参考 DPD 4 次重试的容错语义）。
 const (
-	livenessProbeInterval = 20 * time.Second
-	livenessProbeTimeout  = 90 * time.Second
+	livenessProbeInterval    = 20 * time.Second
+	livenessProbeTimeout     = 90 * time.Second
+	livenessMaxProbeFailures = 3
 )
 
 type PacketSession struct {
@@ -120,6 +128,7 @@ type PacketSession struct {
 	mobikeHandler   func(context.Context, MOBIKERequest) (MOBIKEResult, error)
 	closeHandler    func(context.Context) error
 	livenessHandler func(context.Context) error
+	ikeResponder    *IKEResponder
 	lastInbound     time.Time // 最近一次收到对端下行流量/keepalive 的时间（有流量跳过 DPD）
 	livenessCancel  context.CancelFunc
 	stats           PacketTunnelStats
@@ -163,6 +172,7 @@ func NewPacketSession(cfg PacketSessionConfig) (*PacketSession, error) {
 		mobikeHandler:   cfg.MOBIKEHandler,
 		closeHandler:    cfg.CloseHandler,
 		livenessHandler: cfg.LivenessHandler,
+		ikeResponder:    cfg.IKEResponder,
 		lastInbound:     time.Now(),
 	}, nil
 }
@@ -192,6 +202,7 @@ func (s *PacketSession) StartLivenessLoop(ctx context.Context) {
 		defer cancel()
 		ticker := time.NewTicker(livenessProbeInterval)
 		defer ticker.Stop()
+		consecutiveFailures := 0
 		for {
 			select {
 			case <-ctx.Done():
@@ -202,21 +213,29 @@ func (s *PacketSession) StartLivenessLoop(ctx context.Context) {
 				closed := s.closed
 				s.mu.Unlock()
 				if closed || idle < livenessProbeInterval {
-					continue // 有下行流量（含对端 keepalive）即视为对端存活
+					consecutiveFailures = 0 // 有下行流量（含对端 keepalive）即视为对端存活
+					continue
 				}
 				// 保活探测改为 ESP 层：向隧道对端内网关发 ICMP echo（经 ESP
 				// 加密），对端必回 ESP——这是双向 ESP 流量，ePDG/代理链路都
 				// 按 ESP 流维持。设备实测（112+伦敦 SOCKS5）：IKE INFORMATIONAL
 				// 空探测在会话空闲 ~40s 后被 ePDG 无视（1.5.5 同代理 0.2s 秒回
 				// 是因为它有周期 SIP 事务持续维持 ESP 流），而 ESP 层探测在
-				// REGISTER 期间始终秒回。echo 无响应判定链路死（累计超时）。
+				// REGISTER 期间始终秒回。echo 无响应累计连续 3 次才判定链路死
+				// （单次失败即拆链会被代理偶发丢包误杀健康会话）。
 				probeCtx, probeCancel := context.WithTimeout(ctx, livenessProbeTimeout)
 				err := s.probeESPKeepalive(probeCtx)
 				probeCancel()
 				if err == nil {
+					consecutiveFailures = 0
 					continue
 				}
-				fmt.Fprintf(os.Stderr, "[swu] ESP keepalive probe failed (%v), closing session for re-establishment\n", err)
+				consecutiveFailures++
+				fmt.Fprintf(os.Stderr, "[swu] ESP keepalive probe failed (%v), consecutive=%d/%d\n", err, consecutiveFailures, livenessMaxProbeFailures)
+				if consecutiveFailures < livenessMaxProbeFailures {
+					continue
+				}
+				fmt.Fprintf(os.Stderr, "[swu] ESP keepalive probe failed %d times, closing session for re-establishment\n", consecutiveFailures)
 				_ = s.Close(context.Background())
 				return
 			}
@@ -450,11 +469,15 @@ func (s *PacketSession) Close(ctx context.Context) error {
 	s.closed = true
 	handler := s.closeHandler
 	transport := s.transport
+	responder := s.ikeResponder
 	if s.livenessCancel != nil {
 		s.livenessCancel()
 		s.livenessCancel = nil
 	}
 	s.mu.Unlock()
+	if responder != nil {
+		responder.Close()
+	}
 	var err error
 	if handler != nil {
 		err = handler(ctx)
@@ -590,7 +613,17 @@ func (s *PacketSession) ReadInnerPacket(ctx context.Context) (PacketTunnelPacket
 	}
 	s.mu.Lock()
 	s.lastInbound = time.Now() // 有下行流量即对端存活，DPD 循环据此跳过探测
+	responder := s.ikeResponder
 	s.mu.Unlock()
+	// 入站 IKE 报文（ePDG 主动的 INFORMATIONAL：DPD 探测/DELETE/DEVICE_IDENTITY）
+	// 与 ESP 混流在同一 socket 到达，先经应答方分发——应答方消费的报文
+	// （已回响应或属迟到响应）不进 ESP 解密路径。纯发起方时代这些请求
+	// 被静默丢弃，ePDG DPD 无应答 ~40s 后拆 SA（5min 重建循环的根因）。
+	if responder != nil && looksLikeIKE(packet) {
+		if responder.HandleInbound(ctx, packet) {
+			return s.ReadInnerPacket(ctx) // 继续读下一包（应答已由 responder 发出）
+		}
+	}
 	out, openErr := s.ReceiveESPPacket(ctx, packet)
 	if openErr != nil && errors.Is(openErr, esp.ErrInvalidPacket) && isSPIMismatchError(openErr) {
 		// SPI 不匹配的 ESP 包是旧 SA 迟到流量/混流（设备实测 `spi 00000000`

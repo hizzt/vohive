@@ -268,6 +268,15 @@ func (m *IKEPacketTunnelManager) EstablishTunnel(ctx context.Context, cfg Tunnel
 	}
 	result := tunnelResultFromIKE(cfg, epdg, init, child)
 	closeHandler, mobikeHandler, livenessHandler := m.controlHandlers(transport, init, auth, child, result, transportCfg)
+	// 应答方：ePDG 主动的 INFORMATIONAL（DPD/DELETE/DEVICE_IDENTITY）经
+	// ESP 传输通道原路应答。send 回调绑定 espTransport 的发送路径
+	// （SOCKS5 版即原 relay/端口）；IMEI 来自隧道配置。
+	var responder *IKEResponder
+	if !m.Config.DisableControlPlaneHooks && auth.NextMessageID != 0 && ikeKeysUsable(init.Keys) {
+		responder = NewIKEResponder(init, init.Keys, strings.TrimSpace(cfg.IMEI), func(raw []byte) error {
+			return espTransport.SendESPPacket(context.Background(), raw)
+		})
+	}
 	sessionFactory := m.Config.PacketSessionFactory
 	if sessionFactory == nil {
 		sessionFactory = func(pc PacketSessionConfig) (TunnelSession, error) {
@@ -282,6 +291,7 @@ func (m *IKEPacketTunnelManager) EstablishTunnel(ctx context.Context, cfg Tunnel
 		MOBIKEHandler:   mobikeHandler,
 		CloseHandler:    closeHandler,
 		LivenessHandler: livenessHandler,
+		IKEResponder:    responder,
 	})
 	if err != nil {
 		if closer, ok := espTransport.(ESPPacketTransportCloser); ok {
