@@ -251,6 +251,10 @@ type StartRequest struct {
 	TunnelManager              swu.TunnelManager
 	TunnelManagerFactory       TunnelManagerFactory
 	IMSRegistrar               IMSRegistrar
+	// IMSRegistrarFactory 在隧道建立成功后按隧道结果构造 registrar——SIP
+	// 经隧道收发需要 LocalInnerIP（tun0 内网地址）/P-CSCF 等只在运行时
+	// 已知的参数。设置时优先于 IMSRegistrar。
+	IMSRegistrarFactory func(StartRequest, swu.TunnelResult) IMSRegistrar
 	VoiceTransport             voiceclient.SIPRequestTransport
 	VoiceUserAgent             string
 	VoiceSessionExpires        int
@@ -346,7 +350,7 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 			_ = session.Close(ctx)
 			return nil, fmt.Errorf("SWU tunnel establishment incomplete: %s", firstRuntimeNonEmpty(tunnelResult.Reason, "not ready"))
 		}
-		if notifier, ok := tunnel.(swu.PSCFRestoreNotifier); ok && req.IMSRegistrar != nil {
+		if notifier, ok := tunnel.(swu.PSCFRestoreNotifier); ok && (req.IMSRegistrar != nil || req.IMSRegistrarFactory != nil) {
 			// P-CSCF restoration（TS 24.302 7.2.3.2）：ePDG 经 CFG_REQUEST 下发
 			// 新 P-CSCF 时重做 IMS 注册（re-REGISTER 才会用新地址）。回调只投
 			// 递到带缓冲 channel——执行需要 instance（此刻还没建好），由下方
@@ -359,10 +363,14 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 			})
 		}
 	}
-	imsReady := req.IMSRegistrar == nil
+	imsRegistrar := req.IMSRegistrar
+	if imsRegistrar == nil && req.IMSRegistrarFactory != nil {
+		imsRegistrar = req.IMSRegistrarFactory(req, tunnelResult)
+	}
+	imsReady := imsRegistrar == nil
 	imsReason := ""
 	imsResult := IMSRegistrationResult{}
-	if req.IMSRegistrar != nil {
+	if imsRegistrar != nil {
 		imsCfg := IMSRegistrationConfig{
 			DeviceID:    req.DeviceID,
 			TraceID:     req.TraceID,
@@ -375,11 +383,21 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 			Tunnel:      tunnelResult,
 			Proxy:       req.Proxy,
 		}
-		res, err := req.IMSRegistrar.RegisterIMS(ctx, imsCfg)
+		res, err := imsRegistrar.RegisterIMS(ctx, imsCfg)
 		if err != nil {
+			// 失败必须关隧道：TUN 路由/地址的清理挂在 session.Close 上，
+			// 泄漏会让 tun0 残留旧 inner IP，下一轮 registrar 绑新 inner IP
+			// 发包被内核源校验丢弃（设备实测 REGISTER 全部 i/o timeout 且
+			// ESP 加密出站里根本没有 SIP 包）。
+			if tunnel != nil {
+				_ = tunnel.Close(ctx)
+			}
 			return nil, fmt.Errorf("IMS registration failed: %w", err)
 		}
 		if !res.Registered {
+			if tunnel != nil {
+				_ = tunnel.Close(ctx)
+			}
 			return nil, fmt.Errorf("IMS registration rejected: %d %s", res.StatusCode, strings.TrimSpace(res.Reason))
 		}
 		imsReady = true

@@ -211,7 +211,7 @@ func (t WireSIPTransport) writeTarget(ctx context.Context, network, target strin
 }
 
 func (t WireSIPTransport) dialTarget(ctx context.Context, network, target string, timeout time.Duration) (net.Conn, error) {
-	conn, err := dialSIPConn(ctx, network, target, t.LocalAddr, timeout)
+	conn, err := sipDialFunc(ctx, network, target, t.LocalAddr, timeout)
 	if err != nil {
 		if strings.HasPrefix(strings.ToLower(network), "udp") || strings.HasPrefix(strings.ToLower(network), "tcp") {
 			return nil, err

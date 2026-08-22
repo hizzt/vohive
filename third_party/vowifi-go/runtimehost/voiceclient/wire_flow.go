@@ -345,7 +345,7 @@ func (f *WireSIPFlow) ensureConnLocked(ctx context.Context, msg SIPRequestMessag
 		return f.conn, network, timeout, nil
 	}
 	_ = f.closeConnLocked()
-	conn, err := dialSIPConn(ctx, network, target, f.LocalAddr, timeout)
+	conn, err := sipDialFunc(ctx, network, target, f.LocalAddr, timeout)
 	if err != nil {
 		return nil, "", 0, err
 	}

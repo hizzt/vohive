@@ -89,6 +89,20 @@ func sipTargetsForRequest(ctx context.Context, resolver SIPServerResolver, netwo
 	return targets, nil
 }
 
+// sipDialFunc 是 SIP 连接的可注入拨号函数：默认走系统 socket；隧道数据面
+// （userspace ESP）用它把 SIP 流量导入隧道。third_party 保持零依赖，主仓
+// 或 runtimehost 注入实现。
+var sipDialFunc = dialSIPConn
+
+// SetSIPDialer 注册自定义 SIP 拨号函数（返回原值便于恢复）。
+func SetSIPDialer(fn func(ctx context.Context, network, target, localAddr string, timeout time.Duration) (net.Conn, error)) func(context.Context, string, string, string, time.Duration) (net.Conn, error) {
+	old := sipDialFunc
+	if fn != nil {
+		sipDialFunc = fn
+	}
+	return old
+}
+
 func dialSIPConn(ctx context.Context, network, target, localAddr string, timeout time.Duration) (net.Conn, error) {
 	dialer := net.Dialer{Timeout: timeout}
 	switch network {
@@ -115,7 +129,7 @@ func dialSIPConn(ctx context.Context, network, target, localAddr string, timeout
 }
 
 func (t WireRegisterTransport) roundTripUDP(ctx context.Context, network, target string, timeout time.Duration, msg RegisterMessage) (RegisterResponse, error) {
-	conn, err := dialSIPConn(ctx, network, target, t.LocalAddr, timeout)
+	conn, err := sipDialFunc(ctx, network, target, t.LocalAddr, timeout)
 	if err != nil {
 		return RegisterResponse{}, err
 	}
@@ -165,7 +179,7 @@ func (t WireRegisterTransport) roundTripUDP(ctx context.Context, network, target
 }
 
 func (t WireRegisterTransport) roundTripTCP(ctx context.Context, network, target string, timeout time.Duration, msg RegisterMessage) (RegisterResponse, error) {
-	conn, err := dialSIPConn(ctx, network, target, t.LocalAddr, timeout)
+	conn, err := sipDialFunc(ctx, network, target, t.LocalAddr, timeout)
 	if err != nil {
 		return RegisterResponse{}, err
 	}

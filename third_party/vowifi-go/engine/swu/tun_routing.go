@@ -157,6 +157,12 @@ func buildTUNRoutingCommands(cfg TUNRoutingConfig) ([]ipCommand, error) {
 		commands = append(commands, ipCommand{args: []string{"link", "set", "dev", iface, "mtu", strconv.Itoa(cfg.MTU)}})
 	}
 	commands = append(commands, ipCommand{args: []string{"link", "set", "dev", iface, "up"}})
+	// 清理接口上残留的旧 inner 地址：会话泄漏/异常退出时上一轮的 undo 未
+	// 执行，多地址并存让内核源地址选择错乱（设备实测 registrar 绑新 IP
+	// 的 SIP 包被内核丢弃，REGISTER 全部超时）。`addr flush` 后本轮 add。
+	if len(cfg.Addresses) > 0 {
+		commands = append(commands, ipCommand{args: []string{"addr", "flush", "dev", iface}})
+	}
 	for _, address := range cfg.Addresses {
 		addr, err := normalizeIPPrefix(address, "address")
 		if err != nil {

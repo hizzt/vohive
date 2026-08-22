@@ -31,6 +31,7 @@ func TestLinuxTUNRoutingManagerApplyAndCleanup(t *testing.T) {
 	wantApply := [][]string{
 		{"link", "set", "dev", "vohive0", "mtu", "1400"},
 		{"link", "set", "dev", "vohive0", "up"},
+		{"addr", "flush", "dev", "vohive0"},
 		{"addr", "add", "10.10.0.2/32", "dev", "vohive0"},
 		{"addr", "add", "2001:db8::2/128", "dev", "vohive0"},
 		{"route", "add", "10.20.0.0/24", "dev", "vohive0", "src", "10.10.0.2", "metric", "50", "table", "200"},
@@ -60,7 +61,7 @@ func TestLinuxTUNRoutingManagerApplyAndCleanup(t *testing.T) {
 
 func TestLinuxTUNRoutingManagerRollsBackOnFailure(t *testing.T) {
 	wantErr := errors.New("route failed")
-	runner := &fakeIPRunner{failAt: 3, err: wantErr}
+	runner := &fakeIPRunner{failAt: 4, err: wantErr}
 	manager := LinuxTUNRoutingManager{Runner: runner}
 	_, err := manager.Apply(context.Background(), TUNRoutingConfig{
 		InterfaceName: "vohive0",
@@ -72,6 +73,7 @@ func TestLinuxTUNRoutingManagerRollsBackOnFailure(t *testing.T) {
 	}
 	want := [][]string{
 		{"link", "set", "dev", "vohive0", "up"},
+		{"addr", "flush", "dev", "vohive0"},
 		{"addr", "add", "10.10.0.2/32", "dev", "vohive0"},
 		{"route", "add", "10.20.0.0/24", "dev", "vohive0", "table", "200"},
 		{"addr", "del", "10.10.0.2/32", "dev", "vohive0"},
@@ -104,6 +106,7 @@ func TestLinuxTUNRoutingManagerInstallsEPDGExclusionsBeforeTunnelRoutes(t *testi
 	}
 	wantApply := [][]string{
 		{"link", "set", "dev", "vohive0", "up"},
+		{"addr", "flush", "dev", "vohive0"},
 		{"addr", "add", "10.10.0.2/32", "dev", "vohive0"},
 		{"route", "add", "198.51.100.7/32", "dev", "wwan0", "via", "192.0.2.1", "src", "192.0.2.23", "metric", "5", "table", "main"},
 		{"route", "add", "198.51.100.7/32", "dev", "wwan0", "via", "192.0.2.1", "src", "192.0.2.23", "metric", "5", "table", "200"},

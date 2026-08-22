@@ -3,10 +3,12 @@ package vowifihost
 import (
 	"context"
 	"fmt"
+	"net"
 	"strings"
 	"time"
 
 	swusim "github.com/iniwex5/vowifi-go/engine/sim"
+	"github.com/iniwex5/vowifi-go/engine/swu"
 	"github.com/iniwex5/vowifi-go/runtimehost"
 	"github.com/iniwex5/vowifi-go/runtimehost/eventhost"
 	"github.com/iniwex5/vowifi-go/runtimehost/messaging"
@@ -63,6 +65,32 @@ func (m *Manager) SetRuntimeStartForTest(fn runtimeStartFunc) {
 	m.runtimeStart = fn
 }
 
+// buildVoWiFiIMSRegistrar 按隧道结果构造 IMS 注册器：SIP over UDP 绑
+// tun0 内网地址（LocalInnerIP），ServerAddr 直连 ePDG 下发的 P-CSCF。
+// P-CSCF 缺失时返回 nil——无 P-CSCF 无法注册（本环境 CFG 常态下发，
+// 未下发属异常会话，重建兜底）。
+func buildVoWiFiIMSRegistrar(req runtimehost.StartRequest, tunnel swu.TunnelResult) runtimehost.IMSRegistrar {
+	innerIP := strings.TrimSpace(tunnel.LocalInnerIP)
+	pcscf := strings.TrimSpace(tunnel.PSCFAddress)
+	if innerIP == "" || pcscf == "" {
+		logger.Warn("IMS 注册器未构造：隧道结果缺内网 IP 或 P-CSCF",
+			"device", req.DeviceID,
+			"inner_ip", innerIP,
+			"pcscf", pcscf)
+		return nil
+	}
+	return runtimehost.WireIMSRegistrar{
+		Network:    "udp",
+		LocalAddr:  net.JoinHostPort(innerIP, "0"),
+		ServerAddr: net.JoinHostPort(pcscf, "5060"),
+		// Contact 带 tun0 IP:5060，P-CSCF 据此回寻（路由在 tun0 上）。
+		ContactHost: innerIP,
+		ContactPort: 5060,
+		Timeout:     8 * time.Second,
+		Expires:     3600,
+	}
+}
+
 func (m *Manager) runtimeStarter() runtimeStartFunc {
 	if m != nil && m.runtimeStart != nil {
 		return m.runtimeStart
@@ -106,6 +134,13 @@ func (m *Manager) StartRuntime(ctx context.Context, req RuntimeStartRequest) (Ru
 		Proxy:         req.Prepared.Proxy,
 		DeliveryStore: req.DeliveryStore,
 		Dispatch:      req.Dispatch,
+		// IMS 注册接通（2026-08-22 定案）：之前不传 registrar，runtimehost
+		// imsReady nil 直通为假象——隧道之上零 SIP 业务流，伦敦代理差时段
+		// relay ~7min 回收（v1.5.5 同代理靠周期 SIP 事务存活 35min+）。
+		// WireIMSRegistrar 的 REGISTER→401→AKA digest→200 与 refresh/CRLF
+		// keepalive 循环现成；SIP socket 绑 tun0 内网 IP（TUN 数据面已把
+		// default 路由指到 tun0，P-CSCF 直连无需 DNS）。
+		IMSRegistrarFactory: buildVoWiFiIMSRegistrar,
 		BeforeStart:   req.BeforeStart,
 		ShouldRun: func() bool {
 			return ctx.Err() == nil && m.ShouldRun(deviceID, req.Epoch)
