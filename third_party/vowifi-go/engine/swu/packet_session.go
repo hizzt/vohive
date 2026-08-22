@@ -105,15 +105,15 @@ type PacketSessionConfig struct {
 }
 
 // livenessProbeInterval 是 DPD 探测间隔；livenessProbeTimeout 是单次探测超时。
-// 间隔取 20s：伦敦 SOCKS5 代理对 UDP relay 的下行转发在无双向流约 60-90s
-// 后静默回收（设备 tcpdump 实证：出站 keepalive 正常、入站先停），周期
-// DPD 的请求-响应是双向流，可刷新 relay 生命周期。60s 间隔时探测发出前
-// relay 已死，DPD 必超时 → 会话每 ~105s 重建一次；20s 时 DPD 自身成为
-// 维持流。对齐 1.5.5 的周期 SIP 事务（~45s 双向）+ keepalive(20s) 存活模式。
+// 间隔取 10s：伦敦 SOCKS5 代理对 UDP relay 的下行转发在低流量时按自身
+// 阈值回收（时变，好时段 20s 探测可维持 69min 会话，差时段 7.5min 即回收）。
+// DPD 的请求-响应是双向流，可刷新 relay 生命周期；间隔收紧到 10s 是为
+// 差时段把流量密度提到回收阈值之上（对齐 1.5.5 的 45s SIP 事务+20s
+// keepalive 的总密度；DPD 报文 80B 流量成本可忽略）。
 // livenessMaxProbeFailures 是连续探测失败判死阈值：单次失败即拆链会被
 // 代理偶发丢包误杀（对齐 Python 参考 DPD 4 次重试的容错语义）。
 const (
-	livenessProbeInterval    = 20 * time.Second
+	livenessProbeInterval    = 10 * time.Second
 	livenessProbeTimeout     = 90 * time.Second
 	livenessMaxProbeFailures = 3
 )

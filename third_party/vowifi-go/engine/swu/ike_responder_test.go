@@ -356,3 +356,56 @@ func TestIKEResponderAnswersPSCFRestoration(t *testing.T) {
 		t.Fatalf("onPSCFRestore callback not fired")
 	}
 }
+
+// TestIKEResponderAnswersIMEISVRequest 验证 DEVICE_IDENTITY 请求按类型区分：
+// ePDG 要 IMEISV(0x02) 时回 16 位 IMEISV（IMEI+SV 兜底推导），而非 15 位 IMEI。
+func TestIKEResponderAnswersIMEISVRequest(t *testing.T) {
+	init, keys := responderFixture(t)
+	var sent [][]byte
+	r := NewIKEResponder(init, keys, "123456789012345", func(raw []byte) error {
+		sent = append(sent, append([]byte(nil), raw...))
+		return nil
+	})
+	// 构造 IMEISV 请求通知：数据 = [len(2)][type(1)=0x02]
+	reqPayload, err := ikev2.NotifyPayload(ikev2.Notify{
+		ProtocolID:       ikev2.ProtocolIKE,
+		NotifyType:       ikev2.NotifyDeviceIdentity,
+		NotificationData: []byte{0x00, 0x03, 0x02},
+	})
+	if err != nil {
+		t.Fatalf("NotifyPayload() error = %v", err)
+	}
+	req := buildPeerRequest(t, init, keys, 31, []ikev2.Payload{reqPayload}, false)
+	if !r.HandleInbound(context.Background(), req) {
+		t.Fatalf("HandleInbound() = false, want consumed")
+	}
+	if len(sent) != 1 {
+		t.Fatalf("sent=%d, want 1", len(sent))
+	}
+	_, inner, err := ikev2.UnprotectMessage(sent[0], keys, false)
+	if err != nil {
+		t.Fatalf("UnprotectMessage() error = %v", err)
+	}
+	for _, p := range inner {
+		if p.Type != ikev2.PayloadNotify {
+			continue
+		}
+		n, err := ikev2.ParseNotify(p.Body)
+		if err != nil || n.NotifyType != ikev2.NotifyDeviceIdentity {
+			continue
+		}
+		// 数据布局 [len(2)][type(1)][BCD(8)]，type 必须是 0x02 且 BCD 是 16 位
+		if len(n.NotificationData) < 3 {
+			t.Fatalf("device identity data too short: %x", n.NotificationData)
+		}
+		if got := n.NotificationData[2]; got != ikev2.DeviceIdentityTypeIMEISV {
+			t.Fatalf("identity type=%#x, want IMEISV(0x02)", got)
+		}
+		bcd := n.NotificationData[3:]
+		if len(bcd) != 8 {
+			t.Fatalf("bcd len=%d, want 8 (16 digits)", len(bcd))
+		}
+		return
+	}
+	t.Fatalf("response missing DEVICE_IDENTITY notify")
+}

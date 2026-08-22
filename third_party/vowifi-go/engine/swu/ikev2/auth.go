@@ -1077,8 +1077,8 @@ func authDeviceIdentityRequest(inner []Payload) (byte, bool) {
 	return 0, false
 }
 
-// deviceIdentityForRequest 按请求类型选出 IMEI/IMEISV 值。
-func deviceIdentityForRequest(imei, imeisv string, reqType byte) (DeviceIdentity, error) {
+// DeviceIdentityForRequest 按请求类型选出 IMEI/IMEISV 值（导出给应答方用）。
+func DeviceIdentityForRequest(imei, imeisv string, reqType byte) (DeviceIdentity, error) {
 	imei = strings.TrimSpace(imei)
 	imeisv = strings.TrimSpace(imeisv)
 	if reqType == DeviceIdentityTypeIMEISV {
@@ -1109,7 +1109,7 @@ func answerDeviceIdentityRequest(inner []Payload, identity *DeviceIdentity) *Pay
 	if !requested {
 		return nil
 	}
-	dev, err := deviceIdentityForRequest(identity.Value, "", reqType)
+	dev, err := DeviceIdentityForRequest(identity.Value, "", reqType)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[swu] DEVICE_IDENTITY request with type %d cannot be answered: %v\n", reqType, err)
 		return nil

@@ -137,6 +137,7 @@ func (r *IKEResponder) HandleInbound(ctx context.Context, packet []byte) bool {
 	var deviceErr error
 	hasDelete := false
 	hasDeviceIdentityReq := false
+	deviceIdentityReqType := byte(ikev2.DeviceIdentityTypeIMEI)
 	var cfgRequest *ikev2.Configuration
 	for _, p := range inner {
 		switch p.Type {
@@ -148,6 +149,13 @@ func (r *IKEResponder) HandleInbound(ctx context.Context, packet []byte) bool {
 			switch n.NotifyType {
 			case ikev2.NotifyDeviceIdentity:
 				hasDeviceIdentityReq = true
+				// 请求通知数据尾部 1 字节是期望的身份类型（0x01 IMEI/0x02
+				// IMEISV，见 ParseDeviceIdentityRequest）；数据为空时按默认 IMEI。
+				if len(n.NotificationData) > 0 {
+					if rt := n.NotificationData[len(n.NotificationData)-1]; rt == ikev2.DeviceIdentityTypeIMEISV {
+						deviceIdentityReqType = ikev2.DeviceIdentityTypeIMEISV
+					}
+				}
 			}
 		case ikev2.PayloadDelete:
 			hasDelete = true
@@ -214,25 +222,19 @@ func (r *IKEResponder) HandleInbound(ctx context.Context, packet []byte) bool {
 			go onPSCFRestore(newPSCF)
 		}
 	case hasDeviceIdentityReq:
-		// ePDG 请求设备身份：回 DEVICE_IDENTITY 通知（对齐 Python 参考
-		// handle_INFORMATIONAL_request 的 DEVICE_IDENTITY 分支）。
-		var dev *ikev2.DeviceIdentity
-		if len(imei) == 15 {
-			dev = &ikev2.DeviceIdentity{
-				IdentityType: ikev2.DeviceIdentityTypeIMEI,
-				Value:        imei,
-			}
-		} else {
-			dev = &ikev2.DeviceIdentity{
-				IdentityType: ikev2.DeviceIdentityTypeIMEI,
-				Value:        imei + "0", // IMEI 少于 15 位时凑 IMEISV 形状（极少发生）
-			}
-		}
-		np, err := ikev2.DeviceIdentityNotify(*dev)
+		// ePDG 请求设备身份：按请求类型回 IMEI(0x01)/IMEISV(0x02) 通知
+		// （对齐 Python 参考 handle_INFORMATIONAL_request 的 DEVICE_IDENTITY
+		// 分支；IMEISV 不可用时由 DeviceIdentityForRequest 的 IMEI 兜底推导）。
+		dev, err := ikev2.DeviceIdentityForRequest(imei, "", deviceIdentityReqType)
 		if err != nil {
 			deviceErr = err
 		} else {
-			replyInner = []ikev2.Payload{np}
+			np, nerr := ikev2.DeviceIdentityNotify(dev)
+			if nerr != nil {
+				deviceErr = nerr
+			} else {
+				replyInner = []ikev2.Payload{np}
+			}
 		}
 	default:
 		// 空请求 = ePDG DPD 探测：回空加密响应（静默在线确认）。
