@@ -291,3 +291,68 @@ func peerOutbox(t *testing.T) []byte {
 	}
 	return capture.packets[0]
 }
+
+// TestIKEResponderAnswersPSCFRestoration 验证 P-CSCF restoration 应答：
+// CFG_REQUEST(带 P_CSCF v4 地址) → CFG_REPLY 回显属性类型且 length 0 + 回调触发。
+func TestIKEResponderAnswersPSCFRestoration(t *testing.T) {
+	init, keys := responderFixture(t)
+	var sent [][]byte
+	restored := make(chan string, 1)
+	r := NewIKEResponder(init, keys, "123456789012345", func(raw []byte) error {
+		sent = append(sent, append([]byte(nil), raw...))
+		return nil
+	})
+	r.SetOnPSCFRestore(func(addr string) { restored <- addr })
+
+	cfgPayload, err := ikev2.ConfigurationPayload(ikev2.Configuration{
+		Type: ikev2.CFGRequest,
+		Attributes: []ikev2.ConfigurationAttribute{
+			{Type: ikev2.ConfigInternalIPv4Pcscf, Value: []byte{10, 11, 12, 13}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ConfigurationPayload() error = %v", err)
+	}
+	req := buildPeerRequest(t, init, keys, 21, []ikev2.Payload{cfgPayload}, false)
+	if !r.HandleInbound(context.Background(), req) {
+		t.Fatalf("HandleInbound() = false, want consumed")
+	}
+	if len(sent) != 1 {
+		t.Fatalf("sent=%d responses, want 1", len(sent))
+	}
+	_, inner, err := ikev2.UnprotectMessage(sent[0], keys, false)
+	if err != nil {
+		t.Fatalf("UnprotectMessage() error = %v", err)
+	}
+	found := false
+	for _, p := range inner {
+		if p.Type != ikev2.PayloadCP {
+			continue
+		}
+		cfg, err := ikev2.ParseConfiguration(p.Body)
+		if err != nil {
+			t.Fatalf("ParseConfiguration() error = %v", err)
+		}
+		if cfg.Type != ikev2.CFGReply {
+			t.Fatalf("cfg.Type=%d, want CFGReply", cfg.Type)
+		}
+		if len(cfg.Attributes) != 1 || cfg.Attributes[0].Type != ikev2.ConfigInternalIPv4Pcscf {
+			t.Fatalf("attrs=%+v, want echoed P-CSCF type", cfg.Attributes)
+		}
+		if len(cfg.Attributes[0].Value) != 0 {
+			t.Fatalf("attr value len=%d, want 0 (len-0 echo)", len(cfg.Attributes[0].Value))
+		}
+		found = true
+	}
+	if !found {
+		t.Fatalf("response missing CFG_REPLY")
+	}
+	select {
+	case addr := <-restored:
+		if addr != "10.11.12.13" {
+			t.Fatalf("restored addr=%q, want 10.11.12.13", addr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("onPSCFRestore callback not fired")
+	}
+}

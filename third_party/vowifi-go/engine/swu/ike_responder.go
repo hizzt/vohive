@@ -3,9 +3,9 @@ package swu
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"sync"
-	"time"
 
 	"github.com/iniwex5/vowifi-go/engine/swu/ikev2"
 )
@@ -23,11 +23,11 @@ type IKEResponder struct {
 	mu       sync.Mutex
 	init     ikev2.InitResult
 	keys     ikev2.IKEKeys
-	random   interface{ Read([]byte) (int, error) }
 	imei     string
-	imeiSV   string
 	onDelete func() // 收到 DELETE 通知时触发（nil = 不处理）
-	closed   bool
+	// onPSCFRestore 在 P-CSCF restoration 带来新 P-CSCF 地址时触发（nil = 仅应答）。
+	onPSCFRestore func(string)
+	closed        bool
 
 	send func([]byte) error // 经原 relay/端口发出（nil = 未接线，丢弃请求）
 }
@@ -49,6 +49,17 @@ func (r *IKEResponder) SetOnDelete(fn func()) {
 	}
 	r.mu.Lock()
 	r.onDelete = fn
+	r.mu.Unlock()
+}
+
+// SetOnPSCFRestore 注册 P-CSCF restoration 回调（ePDG 下发新 P-CSCF 地址时
+// 通知上层采纳并重注册 IMS）。
+func (r *IKEResponder) SetOnPSCFRestore(fn func(string)) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.onPSCFRestore = fn
 	r.mu.Unlock()
 }
 
@@ -80,6 +91,7 @@ func (r *IKEResponder) HandleInbound(ctx context.Context, packet []byte) bool {
 	imei := r.imei
 	send := r.send
 	onDelete := r.onDelete
+	onPSCFRestore := r.onPSCFRestore
 	r.mu.Unlock()
 	if closed {
 		return false
@@ -125,6 +137,7 @@ func (r *IKEResponder) HandleInbound(ctx context.Context, packet []byte) bool {
 	var deviceErr error
 	hasDelete := false
 	hasDeviceIdentityReq := false
+	var cfgRequest *ikev2.Configuration
 	for _, p := range inner {
 		switch p.Type {
 		case ikev2.PayloadNotify:
@@ -138,6 +151,15 @@ func (r *IKEResponder) HandleInbound(ctx context.Context, packet []byte) bool {
 			}
 		case ikev2.PayloadDelete:
 			hasDelete = true
+		case ikev2.PayloadCP:
+			cfg, err := ikev2.ParseConfiguration(p.Body)
+			if err != nil {
+				continue
+			}
+			if cfg.Type == ikev2.CFGRequest {
+				copied := cfg
+				cfgRequest = &copied
+			}
 		}
 	}
 	switch {
@@ -153,6 +175,44 @@ func (r *IKEResponder) HandleInbound(ctx context.Context, packet []byte) bool {
 			go onDelete()
 		}
 		return true
+	case cfgRequest != nil:
+		// P-CSCF restoration（TS 24.302 §7.2.3.2 / TS 23.380）：ePDG 主动发
+		// CFG_REQUEST（常带 P_CSCF 地址属性）。UE 必须回 CFG_REPLY 回显请求的
+		// 属性类型且 length 0；若 ePDG 附带了新 P-CSCF 地址则采纳并触发 IMS
+		// 重注册（onPSCFRestore 回调，nil 时仅应答）。
+		// 对齐 Python 参考 handle_pcscf_restoration。
+		replyAttrs := make([]ikev2.ConfigurationAttribute, 0, len(cfgRequest.Attributes))
+		var newPSCF string
+		for _, attr := range cfgRequest.Attributes {
+			replyAttrs = append(replyAttrs, ikev2.ConfigurationAttribute{Type: attr.Type})
+			switch attr.Type {
+			case ikev2.ConfigInternalIPv4Pcscf:
+				if v := net.IP(attr.Value).To4(); v != nil && len(attr.Value) == net.IPv4len && newPSCF == "" {
+					newPSCF = v.String()
+				}
+			case ikev2.ConfigInternalIPv6Pcscf:
+				if v := net.IP(attr.Value).To16(); v != nil && len(attr.Value) == net.IPv6len && newPSCF == "" {
+					newPSCF = v.String()
+				}
+			}
+		}
+		cpPayload, err := ikev2.ConfigurationPayload(ikev2.Configuration{
+			Type:       ikev2.CFGReply,
+			Attributes: replyAttrs,
+		})
+		if err != nil {
+			deviceErr = err
+			replyInner = nil
+		} else {
+			replyInner = []ikev2.Payload{cpPayload}
+		}
+		if os.Getenv("SWU_DEBUG_IKE") != "" {
+			fmt.Fprintf(os.Stderr, "[swu] IKE responder: P-CSCF restoration (attrs=%d newPSCF=%q), replying CFG_REPLY len-0\n",
+				len(replyAttrs), newPSCF)
+		}
+		if onPSCFRestore != nil && newPSCF != "" {
+			go onPSCFRestore(newPSCF)
+		}
 	case hasDeviceIdentityReq:
 		// ePDG 请求设备身份：回 DEVICE_IDENTITY 通知（对齐 Python 参考
 		// handle_INFORMATIONAL_request 的 DEVICE_IDENTITY 分支）。
@@ -207,5 +267,3 @@ func (r *IKEResponder) sendResponse(send func([]byte) error, messageID uint32, i
 	}
 	return send(raw)
 }
-
-var _ = time.Second // 保持 time import（调试输出扩展预留）
