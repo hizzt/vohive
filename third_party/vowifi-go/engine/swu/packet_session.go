@@ -269,7 +269,14 @@ func (s *PacketSession) probeESPKeepalive(ctx context.Context) error {
 		dst = net.ParseIP(strings.TrimSpace(gateway))
 	}
 	if dst == nil {
-		// 无可用探测目标：退化为 NAT-T keepalive（单向，仅保 NAT 映射）
+		// 无可用内网探测目标：改走 IKE DPD（双向交换，ePDG 必回 INFORMATIONAL
+		// 响应——响应经代理 relay 回来即刷新 relay 生命周期与共享下行时间戳）。
+		// 此前的退化路径是单向 NAT-T 0xff：既不能验证对端存活，也维持不了代理
+		// relay 的下行转发（设备实测 RemoteInnerIP/DNS 均空时 probe 退化为 0xff，
+		// 5min 空闲超时循环重建）。livenessHandler 为空才最终退化为 0xff。
+		if handler := s.livenessHandler; handler != nil {
+			return handler(ctx)
+		}
 		return s.sendNATTKeepaliveOnly(ctx)
 	}
 	src := net.ParseIP(strings.TrimSpace(local))

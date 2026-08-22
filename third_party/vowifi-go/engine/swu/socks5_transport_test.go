@@ -22,8 +22,8 @@ type mockSocks5Server struct {
 	mu      sync.Mutex
 	closed  bool
 	tcpLn   net.Listener
-	relayLn *net.UDPConn  // 代理中继 UDP 端点
-	epdgLn  *net.UDPConn  // ePDG 模拟 UDP
+	relayLn *net.UDPConn // 代理中继 UDP 端点
+	epdgLn  *net.UDPConn // ePDG 模拟 UDP
 
 	dropFirst int32 // ePDG 丢弃前 N 个包（模拟丢包，atomic）
 	rxCount   int32 // ePDG 已收包计数（atomic）
@@ -454,6 +454,7 @@ func TestIkeResponseMatchesRequest(t *testing.T) {
 		t.Fatal("SA_INIT 响应（SPIr 非零）应通过弱匹配")
 	}
 }
+
 // TestSocks5UDPTransport_ConcurrentExchangesSerialized 验证并发 ExchangeIKE
 // 被串行化：DPD liveness 与 MOBIKE 漫游同秒触发时，两个交换不能共享读循环
 // 互抢响应（设备实测：msg4 DPD 与 msg5 MOBIKE 并发，msg5 响应被 msg4 的

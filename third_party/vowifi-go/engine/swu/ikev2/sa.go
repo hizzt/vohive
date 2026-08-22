@@ -113,8 +113,8 @@ func comprehensiveESPProposal(spi []byte) SecurityAssociation {
 		return Proposal{Number: num, ProtocolID: ProtocolESP, SPI: spiCopy, Transforms: transforms}
 	}
 	return SecurityAssociation{Proposals: []Proposal{
-		proposal(1, ENCR_AES_CBC, 128, INTEG_HMAC_SHA2_256_128),   // AES-128-CBC + SHA256
-		proposal(2, ENCR_AES_CBC, 128, INTEG_HMAC_SHA1_96),       // AES-128-CBC + SHA1
+		proposal(1, ENCR_AES_CBC, 128, INTEG_HMAC_SHA2_256_128), // AES-128-CBC + SHA256
+		proposal(2, ENCR_AES_CBC, 128, INTEG_HMAC_SHA1_96),      // AES-128-CBC + SHA1
 	}}
 }
 

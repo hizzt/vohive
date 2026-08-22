@@ -16,40 +16,40 @@ const (
 )
 
 const (
-	NotifyUnsupportedCriticalPayload uint16 = 1
-	NotifyInvalidIKESPI              uint16 = 4
-	NotifyInvalidMajorVersion        uint16 = 5
-	NotifyInvalidSyntax              uint16 = 7
-	NotifyInvalidMessageID           uint16 = 9
-	NotifyInvalidSPI                 uint16 = 11
-	NotifyNoProposalChosen           uint16 = 14
-	NotifyInvalidKEPayload           uint16 = 17
-	NotifyAuthenticationFailed       uint16 = 24
-	NotifySinglePairRequired         uint16 = 34
-	NotifyNoAdditionalSAs            uint16 = 35
-	NotifyInternalAddressFailure     uint16 = 36
-	NotifyFailedCPRequired           uint16 = 37
-	NotifyTSUnacceptable             uint16 = 38
-	NotifyInvalidSelectors           uint16 = 39
-	NotifyUnacceptableAddresses      uint16 = 40
-	NotifyUnexpectedNATDetected      uint16 = 41
-	NotifyNATDetectionSourceIP       uint16 = 16388
-	NotifyNATDetectionDestinationIP  uint16 = 16389
-	NotifyCookie                     uint16 = 16390
-	NotifyRekeySA                    uint16 = 16393
-	NotifyMOBIKESupported            uint16 = 16396
-	NotifyAdditionalIPv4Address      uint16 = 16397
-	NotifyAdditionalIPv6Address      uint16 = 16398
-	NotifyNoAdditionalAddresses      uint16 = 16399
-	NotifyUpdateSAAddresses          uint16 = 16400
-	NotifyCookie2                    uint16 = 16401
-	NotifyNoNATsAllowed              uint16 = 16402
-	NotifyInitialContact             uint16 = 16384
-	NotifyEAPOnlyAuthentication      uint16 = 16417
+	NotifyUnsupportedCriticalPayload  uint16 = 1
+	NotifyInvalidIKESPI               uint16 = 4
+	NotifyInvalidMajorVersion         uint16 = 5
+	NotifyInvalidSyntax               uint16 = 7
+	NotifyInvalidMessageID            uint16 = 9
+	NotifyInvalidSPI                  uint16 = 11
+	NotifyNoProposalChosen            uint16 = 14
+	NotifyInvalidKEPayload            uint16 = 17
+	NotifyAuthenticationFailed        uint16 = 24
+	NotifySinglePairRequired          uint16 = 34
+	NotifyNoAdditionalSAs             uint16 = 35
+	NotifyInternalAddressFailure      uint16 = 36
+	NotifyFailedCPRequired            uint16 = 37
+	NotifyTSUnacceptable              uint16 = 38
+	NotifyInvalidSelectors            uint16 = 39
+	NotifyUnacceptableAddresses       uint16 = 40
+	NotifyUnexpectedNATDetected       uint16 = 41
+	NotifyNATDetectionSourceIP        uint16 = 16388
+	NotifyNATDetectionDestinationIP   uint16 = 16389
+	NotifyCookie                      uint16 = 16390
+	NotifyRekeySA                     uint16 = 16393
+	NotifyMOBIKESupported             uint16 = 16396
+	NotifyAdditionalIPv4Address       uint16 = 16397
+	NotifyAdditionalIPv6Address       uint16 = 16398
+	NotifyNoAdditionalAddresses       uint16 = 16399
+	NotifyUpdateSAAddresses           uint16 = 16400
+	NotifyCookie2                     uint16 = 16401
+	NotifyNoNATsAllowed               uint16 = 16402
+	NotifyInitialContact              uint16 = 16384
+	NotifyEAPOnlyAuthentication       uint16 = 16417
 	NotifyIKEv2FragmentationSupported uint16 = 16430
 	// 3GPP TS 24.302 §8.1.2 Table 8.1.2.3-1 私有状态通知（区间 40961-55911）
-	NotifyDeviceIdentity            uint16 = 41101
-	NotifyPCSCFRestoration          uint16 = 41304
+	NotifyDeviceIdentity   uint16 = 41101
+	NotifyPCSCFRestoration uint16 = 41304
 	// 3GPP TS 24.302 §7.2.2.2 附着拒绝（错误区间 9000-9099，其余 3GPP 私有错误散布在 <16384）
 	Notify3GGPGenericAttachRejection uint16 = 9000
 )
@@ -88,7 +88,6 @@ var (
 	ErrInvalidDelete                    = errors.New("invalid ikev2 delete payload")
 	ErrInvalidAddress                   = errors.New("invalid ikev2 address")
 )
-
 
 type Notify struct {
 	ProtocolID       uint8

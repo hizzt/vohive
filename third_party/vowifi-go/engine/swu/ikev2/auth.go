@@ -45,17 +45,17 @@ type AuthConfig struct {
 }
 
 type AuthResult struct {
-	InitialRequestBytes   []byte
-	InitialResponseBytes  []byte
-	IdentityRequestBytes  []byte
-	IdentityResponseBytes []byte
-	InitialResponseInner  []Payload
-	IdentityResponseInner []Payload
-	EAPRequest            *eapaka.Packet
-	EAPAfterIdentity      *eapaka.Packet
-	IdentityTranscript    [][]byte
+	InitialRequestBytes    []byte
+	InitialResponseBytes   []byte
+	IdentityRequestBytes   []byte
+	IdentityResponseBytes  []byte
+	InitialResponseInner   []Payload
+	IdentityResponseInner  []Payload
+	EAPRequest             *eapaka.Packet
+	EAPAfterIdentity       *eapaka.Packet
+	IdentityTranscript     [][]byte
 	DeviceIdentityAnswered *Payload
-	NextMessageID         uint32
+	NextMessageID          uint32
 }
 
 type AKAChallengeConfig struct {
@@ -1216,7 +1216,8 @@ func completeIKEAuthWithAUTH(ctx context.Context, cfg FullAuthConfig, out FullAu
 	return out, fmt.Errorf("%w: EAP success without CHILD_SA", ErrInvalidAuthResponse)
 }
 
-func fullAuthLocalChildSPI(cfg FullAuthConfig) ([]byte, error) {	if len(cfg.ChildSA.Proposals) > 0 && len(cfg.ChildSA.Proposals[0].SPI) > 0 {
+func fullAuthLocalChildSPI(cfg FullAuthConfig) ([]byte, error) {
+	if len(cfg.ChildSA.Proposals) > 0 && len(cfg.ChildSA.Proposals[0].SPI) > 0 {
 		return append([]byte(nil), cfg.ChildSA.Proposals[0].SPI...), nil
 	}
 	if len(cfg.ChildSPI) > 0 {

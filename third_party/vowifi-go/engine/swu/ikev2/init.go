@@ -87,20 +87,20 @@ func (t UDPTransport) ExchangeIKE(ctx context.Context, request []byte) ([]byte, 
 }
 
 type InitConfig struct {
-		Transport         InitTransport
-		Random            io.Reader
-		SA                SecurityAssociation
-		InitiatorSPI      uint64
-		NonceI            []byte
-		X25519PrivateKey  []byte
-		DHGroup           uint16 // 0=Curve25519, 14=MODP2048
-		LocalIP           net.IP
-		LocalPort         uint16
-		RemoteIP          net.IP
-		RemotePort        uint16
-		KeyMaterialLength int
-		Cookie            []byte // ePDG COOKIE 挑战返回的 cookie：非空时 SA_INIT 请求携带 Notify(COOKIE)
-	}
+	Transport         InitTransport
+	Random            io.Reader
+	SA                SecurityAssociation
+	InitiatorSPI      uint64
+	NonceI            []byte
+	X25519PrivateKey  []byte
+	DHGroup           uint16 // 0=Curve25519, 14=MODP2048
+	LocalIP           net.IP
+	LocalPort         uint16
+	RemoteIP          net.IP
+	RemotePort        uint16
+	KeyMaterialLength int
+	Cookie            []byte // ePDG COOKIE 挑战返回的 cookie：非空时 SA_INIT 请求携带 Notify(COOKIE)
+}
 
 type InitResult struct {
 	RequestBytes    []byte
@@ -146,99 +146,99 @@ func RunIKE_SA_INIT(ctx context.Context, cfg InitConfig) (InitResult, error) {
 			return InitResult{}, err
 		}
 	}
-priv, err := x25519PrivateKey(cfg.X25519PrivateKey, random)
+	priv, err := x25519PrivateKey(cfg.X25519PrivateKey, random)
+	if err != nil {
+		return InitResult{}, err
+	}
+	pubI := priv.PublicKey().Bytes()
+	dhGroup := cfg.DHGroup
+	if dhGroup == 0 {
+		dhGroup = DHGroupCurve25519
+	}
+	sa := cfg.SA
+	if len(sa.Proposals) == 0 {
+		sa = DefaultIKEProposal()
+	}
+	saPayload, err := SecurityAssociationPayload(sa)
+	if err != nil {
+		return InitResult{}, err
+	}
+	var kePayload Payload
+	var privKey *big.Int
+	switch dhGroup {
+	case DHGroup2048BitMODP:
+		pubB, privB, err := generateMODP2048Keypair(random)
 		if err != nil {
 			return InitResult{}, err
 		}
-		pubI := priv.PublicKey().Bytes()
-		dhGroup := cfg.DHGroup
-		if dhGroup == 0 {
-			dhGroup = DHGroupCurve25519
-		}
-		sa := cfg.SA
-		if len(sa.Proposals) == 0 {
-			sa = DefaultIKEProposal()
-		}
-		saPayload, err := SecurityAssociationPayload(sa)
+		kePayload = KeyExchangePayload(DHGroup2048BitMODP, pubB)
+		pubI = pubB
+		privKey = privB
+	case DHGroup1024BitMODP:
+		pubB, privB, err := generateMODP1024Keypair(random)
 		if err != nil {
 			return InitResult{}, err
 		}
-		var kePayload Payload
-		var privKey *big.Int
-		switch dhGroup {
-		case DHGroup2048BitMODP:
-			pubB, privB, err := generateMODP2048Keypair(random)
-			if err != nil {
-				return InitResult{}, err
-			}
-			kePayload = KeyExchangePayload(DHGroup2048BitMODP, pubB)
-			pubI = pubB
-			privKey = privB
-		case DHGroup1024BitMODP:
-			pubB, privB, err := generateMODP1024Keypair(random)
-			if err != nil {
-				return InitResult{}, err
-			}
-			kePayload = KeyExchangePayload(DHGroup1024BitMODP, pubB)
-			pubI = pubB
-			privKey = privB
-		default:
-			kePayload = KeyExchangePayload(DHGroupCurve25519, pubI)
+		kePayload = KeyExchangePayload(DHGroup1024BitMODP, pubB)
+		pubI = pubB
+		privKey = privB
+	default:
+		kePayload = KeyExchangePayload(DHGroupCurve25519, pubI)
+	}
+	payloads := []Payload{
+		saPayload,
+		kePayload,
+		NoncePayload(nonceI),
+	}
+	payloads = append(payloads, initNATPayloads(cfg, spiI, 0)...)
+	payloads = append(payloads, MOBIKESupportedNotify())
+	if len(cfg.Cookie) > 0 {
+		// COOKIE 挑战重发：RFC 7296 §2.6 要求把 ePDG 给的 cookie
+		// 原样放进 Notify(COOKIE) 重发 SA_INIT。
+		if cookiePayload, cerr := CookieNotify(cfg.Cookie); cerr == nil {
+			payloads = append(payloads, cookiePayload)
 		}
-		payloads := []Payload{
-			saPayload,
-			kePayload,
-			NoncePayload(nonceI),
-		}
-		payloads = append(payloads, initNATPayloads(cfg, spiI, 0)...)
-		payloads = append(payloads, MOBIKESupportedNotify())
-		if len(cfg.Cookie) > 0 {
-			// COOKIE 挑战重发：RFC 7296 §2.6 要求把 ePDG 给的 cookie
-			// 原样放进 Notify(COOKIE) 重发 SA_INIT。
-			if cookiePayload, cerr := CookieNotify(cfg.Cookie); cerr == nil {
-				payloads = append(payloads, cookiePayload)
-			}
-		}
-		req := Message{
-			Header: Header{
-				InitiatorSPI: spiI,
-				ExchangeType: ExchangeIKE_SA_INIT,
-				Flags:        FlagInitiator,
-			},
-			Payloads: payloads,
-		}
-		reqBytes, err := req.MarshalBinary()
+	}
+	req := Message{
+		Header: Header{
+			InitiatorSPI: spiI,
+			ExchangeType: ExchangeIKE_SA_INIT,
+			Flags:        FlagInitiator,
+		},
+		Payloads: payloads,
+	}
+	reqBytes, err := req.MarshalBinary()
+	if err != nil {
+		return InitResult{}, err
+	}
+	respBytes, err := cfg.Transport.ExchangeIKE(ctx, reqBytes)
+	if err != nil {
+		return InitResult{}, err
+	}
+	resp, err := ParseMessage(respBytes)
+	if err != nil {
+		return InitResult{}, err
+	}
+	parsed, err := parseInitResponse(resp, spiI)
+	if err != nil {
+		return InitResult{}, err
+	}
+	var shared []byte
+	switch dhGroup {
+	case DHGroup2048BitMODP:
+		shared = modp2048SharedSecret(privKey, parsed.keyExchange.KeyData)
+	case DHGroup1024BitMODP:
+		shared = modp1024SharedSecret(privKey, parsed.keyExchange.KeyData)
+	default:
+		respPub, err := ecdh.X25519().NewPublicKey(parsed.keyExchange.KeyData)
 		if err != nil {
-			return InitResult{}, err
+			return InitResult{}, fmt.Errorf("%w: responder KE: %w", ErrInvalidInitResponse, err)
 		}
-		respBytes, err := cfg.Transport.ExchangeIKE(ctx, reqBytes)
+		shared, err = priv.ECDH(respPub)
 		if err != nil {
-			return InitResult{}, err
+			return InitResult{}, fmt.Errorf("%w: ECDH: %w", ErrInvalidInitResponse, err)
 		}
-		resp, err := ParseMessage(respBytes)
-		if err != nil {
-			return InitResult{}, err
-		}
-		parsed, err := parseInitResponse(resp, spiI)
-		if err != nil {
-			return InitResult{}, err
-		}
-		var shared []byte
-		switch dhGroup {
-		case DHGroup2048BitMODP:
-			shared = modp2048SharedSecret(privKey, parsed.keyExchange.KeyData)
-		case DHGroup1024BitMODP:
-			shared = modp1024SharedSecret(privKey, parsed.keyExchange.KeyData)
-		default:
-			respPub, err := ecdh.X25519().NewPublicKey(parsed.keyExchange.KeyData)
-			if err != nil {
-				return InitResult{}, fmt.Errorf("%w: responder KE: %w", ErrInvalidInitResponse, err)
-			}
-			shared, err = priv.ECDH(respPub)
-			if err != nil {
-				return InitResult{}, fmt.Errorf("%w: ECDH: %w", ErrInvalidInitResponse, err)
-			}
-		}
+	}
 	profile, err := KeyMaterialProfileFromSA(parsed.sa)
 	if err != nil {
 		return InitResult{}, err

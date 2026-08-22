@@ -212,7 +212,6 @@ func TestMOBIKENotifyHelpers(t *testing.T) {
 	}
 }
 
-
 func TestInvalidKEPayloadAlternativeGroup(t *testing.T) {
 	n := Notify{NotifyType: NotifyInvalidKEPayload, NotificationData: []byte{0x00, 0x02}}
 	g, ok, err := n.InvalidKEPayloadAlternativeGroup()
@@ -239,4 +238,3 @@ func TestInvalidKEPayloadAlternativeGroup(t *testing.T) {
 		t.Fatalf("non-notify error should not ok")
 	}
 }
-
