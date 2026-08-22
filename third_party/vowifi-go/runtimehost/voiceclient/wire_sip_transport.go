@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
 	"strings"
 	"time"
 )
@@ -137,11 +138,17 @@ func (t WireSIPTransport) roundTripTarget(ctx context.Context, network, target s
 			return SIPResponse{}, err
 		}
 		if !isSIPResponseWire(buf[:n]) {
+			if os.Getenv("SWU_DEBUG_SIP") != "" {
+				fmt.Fprintf(os.Stderr, "[swu] SIP <- non-SIP datagram (%d bytes): %q\n", n, buf[:min(64, n)])
+			}
 			continue
 		}
 		resp, err := ParseSIPResponse(buf[:n])
 		if err != nil {
 			return SIPResponse{}, err
+		}
+		if os.Getenv("SWU_DEBUG_SIP") != "" {
+			fmt.Fprintf(os.Stderr, "[swu] SIP <- %d %s\n---SIP-IN-BEGIN---\n%s\n---SIP-IN-END---\n", resp.StatusCode, resp.Reason, string(buf[:n]))
 		}
 		if !isProvisionalResponse(resp.StatusCode, attempt.Method) {
 			return resp, nil

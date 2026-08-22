@@ -103,8 +103,8 @@ func TestVodafoneProfileUsesV155(t *testing.T) {
 	if !cfg.IKE.EffectiveRetryOnTimeout() {
 		t.Fatalf("Vodafone should retry on timeout")
 	}
-	// NAT-T 必须（ike_success2.pcap 实证）：SOCKS5 场景 NAT_DST 必不匹配，
-	// 检出 NAT 后必须切 4500+marker，否则 ePDG 对 IKE_AUTH 静默丢弃。
+	// NAT-T 必须（ike_success2.pcap 实证 + 08-23 复测）：SOCKS5 场景 NAT_DST
+	// 必不匹配，检出 NAT 后必须切 4500+marker，否则 ePDG 对 IKE_AUTH 静默丢弃。
 	if !cfg.Transport.EffectivePrefer4500OnNATOnly() {
 		t.Fatalf("Vodafone should prefer 4500 on NAT (expect true)")
 	}

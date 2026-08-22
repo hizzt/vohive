@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"sync"
+	"time"
 )
 
 var ErrInvalidPacketPump = errors.New("invalid swu packet pump")
@@ -203,6 +205,7 @@ func (p *PacketPump) deviceToESP(ctx context.Context) {
 
 func (p *PacketPump) espToDevice(ctx context.Context) {
 	defer p.wg.Done()
+	lastStatsLog := time.Now()
 	for {
 		packet, err := p.session.ReadInnerPacket(ctx)
 		if err != nil {
@@ -227,7 +230,18 @@ func (p *PacketPump) espToDevice(ctx context.Context) {
 		p.mu.Lock()
 		p.stats.ESPToDevicePackets++
 		p.stats.ESPToDeviceBytes += uint64(len(packet.Payload))
+		stats := p.stats
 		p.mu.Unlock()
+		// 周期打点下行统计：注册诊断期曾出现"上行 ESP 出站但零下行"的静默故障，
+		// 无周期事件时只能靠 tcpdump 旁证。600ms 内不重复打。
+		if now := time.Now(); now.Sub(lastStatsLog) >= 60*time.Second {
+			lastStatsLog = now
+			logEvent("INFO", "ESP 数据面统计", map[string]string{
+				"out_packets": strconv.FormatUint(stats.DeviceToESPPackets, 10),
+				"in_packets":  strconv.FormatUint(stats.ESPToDevicePackets, 10),
+				"in_bytes":    strconv.FormatUint(stats.ESPToDeviceBytes, 10),
+			})
+		}
 	}
 }
 

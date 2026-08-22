@@ -20,23 +20,26 @@ type IMSSMSTransportFactory func(IMSRegistrationConfig, voiceclient.IMSProfile, 
 type IMSUSSDTransportFactory func(IMSRegistrationConfig, voiceclient.IMSProfile, voiceclient.RegistrationBinding, voiceclient.SIPRequestTransport) messaging.USSDTransport
 
 type WireIMSRegistrar struct {
-	Transport             voiceclient.SIPRegisterTransport
-	TransportFactory      IMSRegisterTransportFactory
-	VoiceTransport        voiceclient.SIPRequestTransport
-	VoiceFactory          IMSVoiceTransportFactory
-	SMSTransport          messaging.SMSTransport
-	SMSFactory            IMSSMSTransportFactory
-	USSDTransport         messaging.USSDTransport
-	USSDFactory           IMSUSSDTransportFactory
-	RegistrarURI          string
-	ContactURI            string
-	ContactHost           string
-	ContactPort           int
-	Network               string
-	ServerAddr            string
-	LocalAddr             string
-	Resolver              voiceclient.SIPServerResolver
-	Timeout               time.Duration
+	Transport        voiceclient.SIPRegisterTransport
+	TransportFactory IMSRegisterTransportFactory
+	VoiceTransport   voiceclient.SIPRequestTransport
+	VoiceFactory     IMSVoiceTransportFactory
+	SMSTransport     messaging.SMSTransport
+	SMSFactory       IMSSMSTransportFactory
+	USSDTransport    messaging.USSDTransport
+	USSDFactory      IMSUSSDTransportFactory
+	RegistrarURI     string
+	ContactURI       string
+	ContactHost      string
+	ContactPort      int
+	Network          string
+	ServerAddr       string
+	LocalAddr        string
+	Resolver         voiceclient.SIPServerResolver
+	Timeout          time.Duration
+	// SecurityPortC 覆盖 Security-Client 头的 port-c（默认 5062）。
+	// 与 SIP 实际监听端口保持一致，>0 时生效。
+	SecurityPortC         int
 	Expires               int
 	DisableRefresh        bool
 	RefreshInterval       time.Duration
@@ -87,6 +90,13 @@ func (r WireIMSRegistrar) RegisterIMS(ctx context.Context, cfg IMSRegistrationCo
 		CallID:       firstRuntimeNonEmpty(r.CallID, cfg.TraceID, cfg.DeviceID+"-ims-register"),
 		CNonce:       firstRuntimeNonEmpty(r.CNonce, cfg.TraceID, cfg.DeviceID),
 		Expires:      expires,
+	}
+	// Security-Client 的 port-c 与实际 SIP socket 端口保持一致：部分运营商
+	// P-CSCF 会把响应发往宣告的保护端口，口径不一致时响应全部落空。
+	if r.SecurityPortC > 0 {
+		agreement := voiceclient.DefaultSecurityClientAgreement(nil)
+		agreement.PortClient = r.SecurityPortC
+		registerSession.SecurityClient = agreement
 	}
 	result, err := registerSession.Register(ctx)
 	if err != nil {

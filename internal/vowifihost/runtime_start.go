@@ -79,15 +79,24 @@ func buildVoWiFiIMSRegistrar(req runtimehost.StartRequest, tunnel swu.TunnelResu
 			"pcscf", pcscf)
 		return nil
 	}
+	// SIP socket 绑固定 50601：REGISTER 的 Security-Client 头宣告 port-c（默认 5062）
+	// （voiceclient.DefaultSecurityPortC），Vodafone P-CSCF 会把 401 等响应发往
+	// 该保护端口；此前绑随机口导致 P-CSCF 回寻落空、注册全部超时。
+	// Contact/Via 同指 5062，三个回寻口径一致。
 	return runtimehost.WireIMSRegistrar{
-		Network:    "udp",
-		LocalAddr:  net.JoinHostPort(innerIP, "0"),
-		ServerAddr: net.JoinHostPort(pcscf, "5060"),
-		// Contact 带 tun0 IP:5060，P-CSCF 据此回寻（路由在 tun0 上）。
-		ContactHost: innerIP,
-		ContactPort: 5060,
-		Timeout:     8 * time.Second,
-		Expires:     3600,
+		Network: "udp",
+		// port-c 与监听端口同源：Security-Client 头宣告一致的 port-c，
+		// 避开 5060-5063 段（部分 P-CSCF 把该段未保护流量直接丢弃）。
+		SecurityPortC: 50601,
+		LocalAddr:     net.JoinHostPort(innerIP, "50601"),
+		ServerAddr:    net.JoinHostPort(pcscf, "5060"),
+		ContactHost:   innerIP,
+		ContactPort:   50601,
+		// P-CSCF 的 SIP 响应经伦敦中继实测 ~8s 才回：8s 超时会在响应
+		// 到达前一刻拆会话（ESP 解密时 ctx 已取消），拉长到 25s 让
+		// 401/200 都能等到，SIP 自身有 500ms-4s 指数重传兜底丢包。
+		Timeout: 25 * time.Second,
+		Expires: 3600,
 	}
 }
 
@@ -141,7 +150,7 @@ func (m *Manager) StartRuntime(ctx context.Context, req RuntimeStartRequest) (Ru
 		// keepalive 循环现成；SIP socket 绑 tun0 内网 IP（TUN 数据面已把
 		// default 路由指到 tun0，P-CSCF 直连无需 DNS）。
 		IMSRegistrarFactory: buildVoWiFiIMSRegistrar,
-		BeforeStart:   req.BeforeStart,
+		BeforeStart:         req.BeforeStart,
 		ShouldRun: func() bool {
 			return ctx.Err() == nil && m.ShouldRun(deviceID, req.Epoch)
 		},

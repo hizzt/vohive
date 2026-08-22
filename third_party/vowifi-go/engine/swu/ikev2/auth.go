@@ -190,10 +190,14 @@ func dumpAuthPayloadTypes(tag string, payloads []Payload) {
 		case PayloadCP:
 			if len(p.Body) >= 1 {
 				cpType := p.Body[0]
-				fmt.Fprintf(os.Stderr, "[swu] %s: CP type=%d len=%d\n", tag, cpType, len(p.Body))
+				fmt.Fprintf(os.Stderr, "[swu] %s: CP type=%d len=%d body=%x\n", tag, cpType, len(p.Body), p.Body)
 			}
 		default:
-			fmt.Fprintf(os.Stderr, "[swu] %s: payload type=%d len=%d\n", tag, p.Type, len(p.Body))
+			hexLen := len(p.Body)
+			if hexLen > 96 {
+				hexLen = 96
+			}
+			fmt.Fprintf(os.Stderr, "[swu] %s: payload type=%d len=%d body=%x\n", tag, p.Type, len(p.Body), p.Body[:hexLen])
 		}
 	}
 }

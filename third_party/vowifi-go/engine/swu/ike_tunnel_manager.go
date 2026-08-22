@@ -324,6 +324,7 @@ func (m *IKEPacketTunnelManager) EstablishTunnel(ctx context.Context, cfg Tunnel
 		"epdg":        result.EPDGAddress,
 		"inner_ip":    firstPacketNonEmpty(result.LocalInnerIP, "-"),
 		"psc":         firstPacketNonEmpty(result.PSCFAddress, "-"),
+		"dns":         strings.Join(result.DNSServers, ","),
 		"child_spi":   result.ChildSAIdentifier,
 	})
 	return session, nil

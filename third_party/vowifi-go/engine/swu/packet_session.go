@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -644,6 +645,10 @@ func (s *PacketSession) ReadInnerPacket(ctx context.Context) (PacketTunnelPacket
 		s.recordInboundError(err)
 		return PacketTunnelPacket{}, err
 	}
+	if os.Getenv("SWU_DEBUG_ESP") != "" && len(packet) >= 8 {
+		spi := binary.BigEndian.Uint32(packet[0:4])
+		fmt.Fprintf(os.Stderr, "[swu] ESP in (%d bytes) spi=%08x seq=%d\n", len(packet), spi, binary.BigEndian.Uint32(packet[4:8]))
+	}
 	s.mu.Lock()
 	s.lastInbound = time.Now() // 有下行流量即对端存活，DPD 循环据此跳过探测
 	responder := s.ikeResponder
@@ -658,6 +663,13 @@ func (s *PacketSession) ReadInnerPacket(ctx context.Context) (PacketTunnelPacket
 		}
 	}
 	out, openErr := s.ReceiveESPPacket(ctx, packet)
+	if os.Getenv("SWU_DEBUG_ESP") != "" {
+		if openErr != nil {
+			fmt.Fprintf(os.Stderr, "[swu] ESP open err: %v\n", openErr)
+		} else {
+			fmt.Fprintf(os.Stderr, "[swu] ESP open ok: inner %d bytes nextHeader=%d\n", len(out.Payload), out.NextHeader)
+		}
+	}
 	if openErr != nil && errors.Is(openErr, esp.ErrInvalidPacket) && isSPIMismatchError(openErr) {
 		// SPI 不匹配的 ESP 包是旧 SA 迟到流量/混流（设备实测 `spi 00000000`
 		// 单包曾把健康会话连着 pump 一起杀掉触发重建），丢弃继续读下一包。

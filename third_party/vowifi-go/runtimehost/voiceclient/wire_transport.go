@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -239,6 +240,9 @@ func buildSIPRequestWire(msg SIPRequestMessage, transport string, localAddr net.
 	writeOrderedHeaders(&out, headers)
 	out.WriteString("\r\n")
 	out.Write(msg.Body)
+	if os.Getenv("SWU_DEBUG_SIP") != "" {
+		fmt.Fprintf(os.Stderr, "[swu] SIP -> %s %s (%d bytes wire)\n---SIP-BEGIN---\n%s\n---SIP-END---\n", method, uri, out.Len(), out.String())
+	}
 	return out.Bytes(), nil
 }
 

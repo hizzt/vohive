@@ -146,8 +146,9 @@ var builtinCarriers = map[string]EffectiveCarrierConfig{
 		Transport: CarrierTransportProfile{
 			// NAT-T 必须：SOCKS5 代理场景 ePDG 看到的是代理出口（伦敦）IP 而非
 			// 本机 IP，NAT_DETECTION_DESTINATION_IP 必然不匹配（NAT 已检出）。
-			// ike_success2.pcap（08-20 15:12 成功握手）实证：IKE_AUTH 及后续全部
-			// 报文走 4500 + 4 字节 marker；留在 500 端口则 ePDG 对 IKE_AUTH 静默。
+			// ike_success2.pcap 实证：IKE_AUTH 及后续全部报文走 4500 + 4 字节
+			// marker；留在 500 则 ePDG 对 IKE_AUTH 静默。08-23 01:00 A/B 复测
+			// 再次证实（500 上 IKE_AUTH 全超时）。
 			Prefer4500OnNATOnly:   boolPtr(true),
 			KeepSOCKSControlAlive: boolPtr(true),
 			RequestPCSCF:          boolPtr(false),

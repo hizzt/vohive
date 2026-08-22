@@ -480,6 +480,13 @@ func (t *Socks5UDPTransport) ReadESPPacket(ctx context.Context) ([]byte, error) 
 			idleStart = time.Now()
 			continue
 		}
+		// NAT-T 下行 marker 剥离：本链路（伦敦 relay/4500）实测 ePDG 的 ESP 下行
+		// 同样带 4 字节 0x00 marker（IKE 响应同款处理在 ExchangeIKE），不剥则
+		// SPI 错位读出 00000000，Open 全部失败——SIP 响应因此从未到达注册器。
+		// 真实 ESP 的 SPI 不为 0，前 4 字节全零只可能是 marker，误剥风险可忽略。
+		if t.useNATT && len(payload) >= 4 && payload[0] == 0 && payload[1] == 0 && payload[2] == 0 && payload[3] == 0 {
+			payload = payload[4:]
+		}
 		idleStart = time.Now()
 		return payload, nil
 	}
