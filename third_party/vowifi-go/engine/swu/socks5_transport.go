@@ -57,6 +57,8 @@ type Socks5UDPTransport struct {
 
 	controlConn      net.Conn
 	keepControlAlive bool
+	espBacklog [][]byte
+	espBacklogMu sync.Mutex
 }
 
 var _ ikev2.InitTransport = (*Socks5UDPTransport)(nil)
@@ -274,9 +276,13 @@ func (t *Socks5UDPTransport) ExchangeIKE(ctx context.Context, request []byte) ([
 				p = p[4:]
 			}
 			if !looksLikeIKE(p) {
+				// 混流的 ESP 数据包不丢弃：转交 ESP 侧缓冲，由 packet pump 消费
+				// （IKE_AUTH 响应同毫秒常伴随 ePDG 的首条 ESP——此前被静默丢弃，
+				// 既丢数据又丢"child SA 密钥是否正确"的裁决证据）。
 				if os.Getenv("SWU_DEBUG_IKE") != "" {
-					fmt.Fprintf(os.Stderr, "[swu] IKE <- skipped non-IKE datagram (%d bytes): %x\n", len(p), p[:min(32, len(p))])
+					fmt.Fprintf(os.Stderr, "[swu] IKE <- handing off non-IKE datagram (%d bytes): %x\n", len(p), p[:min(32, len(p))])
 				}
+				t.deferESP(p)
 				continue
 			}
 			if headerErr == nil && !ikeResponseMatchesRequest(p, reqHeader) {
@@ -401,6 +407,11 @@ func (t *Socks5UDPTransport) LastInboundAt() time.Time {
 }
 
 // SendESPPacket 通过 SOCKS5 UDP Associate 中继一个 ESP 数据包。
+// 注意：本链路（伦敦 relay/4500）上行 ESP **不带** NAT-T marker——v155 同链路
+// 实抓帧（SOCKS 头后直接是 SPI）证明 ePDG 只接受裸 ESP；加了 4B 0x00 前缀后
+// ePDG 侧 SPI 错位、解密失败、全部静默丢弃（REGISTER/TCP SYN 零响应的根因）。
+// 下行则相反：ePDG 发来的 ESP 带 marker，ReadESPPacket 负责剥离——上下行
+// 不对称是这条 relay 链路的实测行为，与 RFC 3948 的对称语义不同。
 func (t *Socks5UDPTransport) SendESPPacket(ctx context.Context, data []byte) error {
 	t.mu.Lock()
 	udpConn := t.udpConn
@@ -442,6 +453,16 @@ func (t *Socks5UDPTransport) ReadESPPacket(ctx context.Context) ([]byte, error) 
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
+		}
+		if p := t.takeDeferredESP(); p != nil {
+			if len(p) == 1 && p[0] == 0xff {
+				idleStart = time.Now()
+				continue
+			}
+			if t.useNATT && len(p) >= 4 && p[0] == 0 && p[1] == 0 && p[2] == 0 && p[3] == 0 {
+				p = p[4:]
+			}
+			return p, nil
 		}
 		readDeadline := time.Now().Add(nattKeepaliveInterval)
 		if d, ok := ctx.Deadline(); ok && d.Before(readDeadline) {
@@ -498,6 +519,28 @@ const nattKeepaliveInterval = 15 * time.Second
 // nattIdleSessionTimeout 是会话空闲上限：超过该时长无任何下行 ESP/keepalive
 // 即判定会话死链，返回错误触发重建。
 const nattIdleSessionTimeout = 5 * time.Minute
+
+// deferESP 暂存 ExchangeIKE 读循环里混流到达的 ESP 数据包，供 ReadESPPacket
+// 优先取回。容量 8，溢出丢最旧（混流包仅握手/DPD 期少量出现）。
+func (t *Socks5UDPTransport) deferESP(p []byte) {
+	t.espBacklogMu.Lock()
+	defer t.espBacklogMu.Unlock()
+	if len(t.espBacklog) >= 8 {
+		t.espBacklog = t.espBacklog[1:]
+	}
+	t.espBacklog = append(t.espBacklog, append([]byte(nil), p...))
+}
+
+func (t *Socks5UDPTransport) takeDeferredESP() []byte {
+	t.espBacklogMu.Lock()
+	defer t.espBacklogMu.Unlock()
+	if len(t.espBacklog) == 0 {
+		return nil
+	}
+	p := t.espBacklog[0]
+	t.espBacklog = t.espBacklog[1:]
+	return p
+}
 
 // Close 关闭 SOCKS5 传输层。
 func (t *Socks5UDPTransport) Close(ctx context.Context) error {

@@ -150,6 +150,7 @@ func TestWireIMSRegistrarHandlesAKADigestChallenge(t *testing.T) {
 		t.Fatalf("result=%+v requests=%d", res, len(transport.requests))
 	}
 	second := transport.requests[1]
+	// digest username = 标准 IMPI（IMSI@home domain，Vodafone UK HSS 用户键）。
 	if !strings.Contains(second.Headers["Authorization"], `username="310280233641503@ims.mnc280.mcc310.3gppnetwork.org"`) {
 		t.Fatalf("Authorization=%q", second.Headers["Authorization"])
 	}
@@ -382,7 +383,7 @@ func TestWireIMSRegistrarRecoverReturnsUpdatedBinding(t *testing.T) {
 	if len(requests) != 3 {
 		t.Fatalf("requests=%d %+v", len(requests), requests)
 	}
-	if !strings.Contains(requests[1].wire, "Call-ID: trace-manual-recover-recovery-1\r\n") ||
+	if !strings.Contains(requests[1].wire, "Call-ID: urn:uuid:") || !strings.Contains(requests[1].wire, "-recovery-1\r\n") ||
 		!strings.Contains(requests[1].wire, "CSeq: 1 REGISTER\r\n") {
 		t.Fatalf("recovery REGISTER wire=%q", requests[1].wire)
 	}
@@ -668,21 +669,21 @@ func TestWireIMSRegistrarRecoversRegistrationAfterRefresh503(t *testing.T) {
 	if len(requests) < 4 {
 		t.Fatalf("requests=%d %+v", len(requests), requests)
 	}
-	if !strings.Contains(requests[0].wire, "Call-ID: trace-recover\r\n") ||
+	if !strings.Contains(requests[0].wire, "Call-ID: urn:uuid:") ||
 		!strings.Contains(requests[0].wire, "CSeq: 1 REGISTER\r\n") {
 		t.Fatalf("initial REGISTER wire=%q", requests[0].wire)
 	}
-	if !strings.Contains(requests[1].wire, "Call-ID: trace-recover\r\n") ||
+	if !strings.Contains(requests[1].wire, "Call-ID: urn:uuid:") ||
 		!strings.Contains(requests[1].wire, "CSeq: 2 REGISTER\r\n") {
 		t.Fatalf("refresh wire=%q", requests[1].wire)
 	}
-	if !strings.Contains(requests[2].wire, "Call-ID: trace-recover-recovery-1\r\n") ||
+	if !strings.Contains(requests[2].wire, "Call-ID: urn:uuid:") || !strings.Contains(requests[2].wire, "-recovery-1\r\n") ||
 		!strings.Contains(requests[2].wire, "CSeq: 1 REGISTER\r\n") ||
 		!strings.Contains(requests[2].wire, "Expires: 60\r\n") {
 		t.Fatalf("recovery REGISTER wire=%q", requests[2].wire)
 	}
 	last := requests[len(requests)-1]
-	if !strings.Contains(last.wire, "Call-ID: trace-recover-recovery-1\r\n") ||
+	if !strings.Contains(last.wire, "Call-ID: urn:uuid:") || !strings.Contains(last.wire, "-recovery-1\r\n") ||
 		!strings.Contains(last.wire, "CSeq: 2 REGISTER\r\n") ||
 		!strings.Contains(last.wire, "Expires: 0\r\n") {
 		t.Fatalf("deregister wire=%q", last.wire)
@@ -784,8 +785,13 @@ func TestWireIMSRegistrarRefreshAndCloseAdvanceDigestNonceCount(t *testing.T) {
 			t.Fatalf("REGISTER lifecycle used different flows: %+v", requests)
 		}
 	}
-	if strings.Contains(requests[0].wire, "Authorization:") {
+	// 首个 REGISTER 现带 aka_empty 占位 Authorization（imscore 变体先例），
+	// 但不得是已鉴权形态（无 nc=）。
+	if strings.Contains(requests[0].wire, "nc=") {
 		t.Fatalf("initial REGISTER unexpectedly authenticated: %q", requests[0].wire)
+	}
+	if !strings.Contains(requests[0].wire, "Authorization: Digest") {
+		t.Fatalf("initial REGISTER missing aka_empty Authorization: %q", requests[0].wire)
 	}
 	if !strings.Contains(requests[1].wire, "Authorization: Digest") || !strings.Contains(requests[1].wire, "nc=00000001") ||
 		!strings.Contains(requests[1].wire, "CSeq: 2 REGISTER\r\n") {

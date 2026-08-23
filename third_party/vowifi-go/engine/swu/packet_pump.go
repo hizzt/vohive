@@ -46,18 +46,33 @@ type PacketPumpStats struct {
 	DeviceWriteErrors  uint64
 	ESPReadErrors      uint64
 	ESPSendErrors      uint64
+	// IMS ipsec-3gpp ESP 层逐包失败计数（丢包不杀泵）。
+	DeviceToESPTransformErrors uint64
+	ESPToDeviceTransformErrors uint64
+}
+
+// InnerPacketTransform 在 pump 收发路径上对内层 IP 包做逐包变换
+// （IMS ipsec-3gpp 的 userspace ESP 封装/解封装）。nil 时直通。
+// 变换错误只丢当前包并计数，不终止泵——ESP 层坏包（重放/ICV 失配）
+// 不应拖垮整个隧道。
+type InnerPacketTransform interface {
+	TransformOutbound(packet []byte) ([]byte, error)
+	TransformInbound(packet []byte) ([]byte, error)
 }
 
 type PacketPumpConfig struct {
 	Session PacketTunnelReadSession
 	Device  InnerPacketDevice
-	OnError func(PacketPumpDirection, error)
+	// Transform 可选；Install 前的实现必须透传（imsipsec.Transform 即如此）。
+	Transform InnerPacketTransform
+	OnError   func(PacketPumpDirection, error)
 }
 
 type PacketPump struct {
-	session PacketTunnelReadSession
-	device  InnerPacketDevice
-	onError func(PacketPumpDirection, error)
+	session  PacketTunnelReadSession
+	device   InnerPacketDevice
+	transform InnerPacketTransform
+	onError  func(PacketPumpDirection, error)
 
 	mu      sync.Mutex
 	stats   PacketPumpStats
@@ -77,10 +92,11 @@ func NewPacketPump(cfg PacketPumpConfig) (*PacketPump, error) {
 		return nil, fmt.Errorf("%w: device is nil", ErrInvalidPacketPump)
 	}
 	return &PacketPump{
-		session: cfg.Session,
-		device:  cfg.Device,
-		onError: cfg.OnError,
-		done:    make(chan struct{}),
+		session:   cfg.Session,
+		device:    cfg.Device,
+		transform: cfg.Transform,
+		onError:   cfg.OnError,
+		done:      make(chan struct{}),
 	}, nil
 }
 
@@ -188,6 +204,19 @@ func (p *PacketPump) deviceToESP(ctx context.Context) {
 		if len(packet) == 0 {
 			continue
 		}
+		if p.transform != nil {
+			transformed, err := p.transform.TransformOutbound(packet)
+			if err != nil {
+				p.mu.Lock()
+				p.stats.DeviceToESPTransformErrors++
+				p.mu.Unlock()
+				logEvent("WARN", "IMS ESP 出向封装失败，丢包", map[string]string{
+					"error": err.Error(),
+				})
+				continue
+			}
+			packet = transformed
+		}
 		if err := p.session.SendInnerPacket(ctx, packet); err != nil {
 			if p.isNormalStop(ctx, err) {
 				p.requestStop()
@@ -219,7 +248,21 @@ func (p *PacketPump) espToDevice(ctx context.Context) {
 		if len(packet.Payload) == 0 {
 			continue
 		}
-		if err := p.device.WriteInnerPacket(ctx, packet.Payload); err != nil {
+		payload := packet.Payload
+		if p.transform != nil {
+			transformed, err := p.transform.TransformInbound(payload)
+			if err != nil {
+				p.mu.Lock()
+				p.stats.ESPToDeviceTransformErrors++
+				p.mu.Unlock()
+				logEvent("WARN", "IMS ESP 入向解封失败，丢包", map[string]string{
+					"error": err.Error(),
+				})
+				continue
+			}
+			payload = transformed
+		}
+		if err := p.device.WriteInnerPacket(ctx, payload); err != nil {
 			if p.isNormalStop(ctx, err) {
 				p.requestStop()
 				return

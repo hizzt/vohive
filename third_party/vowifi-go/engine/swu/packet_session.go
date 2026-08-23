@@ -667,7 +667,11 @@ func (s *PacketSession) ReadInnerPacket(ctx context.Context) (PacketTunnelPacket
 		if openErr != nil {
 			fmt.Fprintf(os.Stderr, "[swu] ESP open err: %v\n", openErr)
 		} else {
-			fmt.Fprintf(os.Stderr, "[swu] ESP open ok: inner %d bytes nextHeader=%d\n", len(out.Payload), out.NextHeader)
+			hexLen := len(out.Payload)
+			if hexLen > 64 {
+				hexLen = 64
+			}
+			fmt.Fprintf(os.Stderr, "[swu] ESP open ok: inner %d bytes nextHeader=%d payload=%x\n", len(out.Payload), out.NextHeader, out.Payload[:hexLen])
 		}
 	}
 	if openErr != nil && errors.Is(openErr, esp.ErrInvalidPacket) && isSPIMismatchError(openErr) {

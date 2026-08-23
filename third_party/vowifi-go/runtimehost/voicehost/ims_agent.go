@@ -297,6 +297,55 @@ func (a *IMSOutboundAgent) EndVoiceCall(ctx context.Context, info DialogInfo) er
 	return nil
 }
 
+// SendKeepaliveCRLF 发 RFC 3261 §18 的 CRLF keepalive（"\r\n\r\n"，SIP over
+// TCP 标准保活，4 字节零事务开销）。v155 反编译实证其 keepalive 走此路径
+// （"Keep alive CRLF received"），比周期 OPTIONS 事务更贴近原生指纹也省流量。
+// 底层不是 WireSIPFlow（自定义 transport/mock）时回退 OPTIONS 事务。
+// 写失败（连接被 P-CSCF 按旧 SA 处置/半死）时 Reset 流并立即重试一次——
+// 自愈 SA 换装后的挂死连接。
+func (a *IMSOutboundAgent) SendKeepaliveCRLF(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	sender, ok := a.flowKeepaliveSender()
+	if !ok {
+		return a.SendKeepaliveOptions(ctx)
+	}
+	if err := sender(ctx); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		a.ResetSIPFlow()
+		if err2 := sender(ctx); err2 != nil {
+			return err2
+		}
+	}
+	return nil
+}
+
+// ResetSIPFlow 重建底层 SIP 流连接（SA 换装/连接挂死后自愈）。
+func (a *IMSOutboundAgent) ResetSIPFlow() {
+	a.mu.Lock()
+	transport := a.Transport
+	a.mu.Unlock()
+	if resetter, ok := transport.(interface{ Reset() error }); ok {
+		_ = resetter.Reset()
+	}
+}
+
+// flowKeepaliveSender 取底层 WireSIPFlow 的 CRLF 发送函数；Transport 不是
+// 流式连接（如注入的自定义 transport）时返回 false。
+func (a *IMSOutboundAgent) flowKeepaliveSender() (func(context.Context) error, bool) {
+	a.mu.Lock()
+	transport := a.Transport
+	a.mu.Unlock()
+	flow, ok := transport.(*voiceclient.WireSIPFlow)
+	if !ok {
+		return nil, false
+	}
+	return flow.SendCRLFKeepalive, true
+}
+
 // SendKeepaliveOptions 发一条 dialog 外 SIP OPTIONS（对端=注册公共身份）。
 // 用途：会话空闲期维持经 ESP 隧道的双向 SIP 业务流——设备对照实证（112+
 // 伦敦 SOCKS5，2026-08-22）：v1.5.5 靠周期 SIP 事务在 relay 差时段存活

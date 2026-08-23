@@ -3,7 +3,9 @@ package vowifihost
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 
@@ -11,6 +13,7 @@ import (
 	"github.com/iniwex5/vowifi-go/engine/swu"
 	"github.com/iniwex5/vowifi-go/runtimehost"
 	"github.com/iniwex5/vowifi-go/runtimehost/eventhost"
+	"github.com/iniwex5/vowifi-go/runtimehost/imsipsec"
 	"github.com/iniwex5/vowifi-go/runtimehost/messaging"
 	"github.com/iniwex5/vowifi-go/runtimehost/voicehost"
 
@@ -79,19 +82,24 @@ func buildVoWiFiIMSRegistrar(req runtimehost.StartRequest, tunnel swu.TunnelResu
 			"pcscf", pcscf)
 		return nil
 	}
-	// SIP socket 绑固定 50601：REGISTER 的 Security-Client 头宣告 port-c（默认 5062）
-	// （voiceclient.DefaultSecurityPortC），Vodafone P-CSCF 会把 401 等响应发往
-	// 该保护端口；此前绑随机口导致 P-CSCF 回寻落空、注册全部超时。
-	// Contact/Via 同指 5062，三个回寻口径一致。
+	// SIP socket 绑随机高段保护端口（mdd/Asterisk 先例：sec_port_c_min=40000/
+	// max=44999）：首个 REGISTER 从本端口直发 P-CSCF 5060，Security-Client 宣告
+	// 同值 port-c；Contact/Via 同指本端口，三个回寻口径一致。此前固定 50601
+	// （仍落在 P-CSCF 可能按段丢弃的 5060+ 区附近），参考实现 1239t 同样用
+	// 随机 ephemeral 端口（registerAttemptLocalPort→randomEphemeralSIPPort）。
+	portC := 40000 + rand.Intn(5000)
+	portS := 40000 + rand.Intn(5000)
 	return runtimehost.WireIMSRegistrar{
-		Network: "udp",
-		// port-c 与监听端口同源：Security-Client 头宣告一致的 port-c，
-		// 避开 5060-5063 段（部分 P-CSCF 把该段未保护流量直接丢弃）。
-		SecurityPortC: 50601,
-		LocalAddr:     net.JoinHostPort(innerIP, "50601"),
+		Network: "tcp",
+		SecurityPortC: portC,
+		SecurityPortS: portS,
+		LocalAddr:     net.JoinHostPort(innerIP, strconv.Itoa(portC)),
 		ServerAddr:    net.JoinHostPort(pcscf, "5060"),
 		ContactHost:   innerIP,
-		ContactPort:   50601,
+		ContactPort:   portC,
+		// TS 33.203 ipsec-3gpp 二层 ESP：registrar 在 AKA 成功后 Install，
+		// tun pump 对 port-c↔port-s 的 SIP 做 ESP 封装（明文 CSeq3 实测 401）。
+		IPsecTransform: req.IMSIPsecTransform,
 		// P-CSCF 的 SIP 响应经伦敦中继实测 ~8s 才回：8s 超时会在响应
 		// 到达前一刻拆会话（ESP 解密时 ctx 已取消），拉长到 25s 让
 		// 401/200 都能等到，SIP 自身有 500ms-4s 指数重传兜底丢包。
@@ -149,7 +157,10 @@ func (m *Manager) StartRuntime(ctx context.Context, req RuntimeStartRequest) (Ru
 		// WireIMSRegistrar 的 REGISTER→401→AKA digest→200 与 refresh/CRLF
 		// keepalive 循环现成；SIP socket 绑 tun0 内网 IP（TUN 数据面已把
 		// default 路由指到 tun0，P-CSCF 直连无需 DNS）。
+		// ipsec-3gpp transform 同一实例贯穿 tun pump（数据面）与 registrar
+		// （控制面 Install）——必须在 tunnel 建立前创建并传入两者。
 		IMSRegistrarFactory: buildVoWiFiIMSRegistrar,
+		IMSIPsecTransform:   imsipsec.NewTransform(),
 		BeforeStart:         req.BeforeStart,
 		ShouldRun: func() bool {
 			return ctx.Err() == nil && m.ShouldRun(deviceID, req.Epoch)

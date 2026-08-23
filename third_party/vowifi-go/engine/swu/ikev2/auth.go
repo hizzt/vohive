@@ -168,6 +168,13 @@ func dumpAuthPayloadTypes(tag string, payloads []Payload) {
 	if os.Getenv("SWU_DEBUG_AUTH") == "" && os.Getenv("SWU_DEBUG_IKE") == "" {
 		return
 	}
+	// payload 链边界诊断：SA 解析失败根因排查用（payload 长度链错位会表现为
+	// body 前缀 00000028 之类的"通用头残留"）。
+	if os.Getenv("SWU_DEBUG_ESP") != "" {
+		for i, p := range payloads {
+			fmt.Fprintf(os.Stderr, "[swu] %s: payload[%d] type=%d next=%d bodylen=%d\n", tag, i, p.Type, p.NextPayload, len(p.Body))
+		}
+	}
 	for _, p := range payloads {
 		switch p.Type {
 		case PayloadNotify:

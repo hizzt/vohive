@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/iniwex5/vowifi-go/runtimehost/identity"
+	"github.com/iniwex5/vowifi-go/runtimehost/imsipsec"
 	"github.com/iniwex5/vowifi-go/runtimehost/messaging"
 	"github.com/iniwex5/vowifi-go/runtimehost/voiceclient"
 )
@@ -39,7 +41,14 @@ type WireIMSRegistrar struct {
 	Timeout          time.Duration
 	// SecurityPortC 覆盖 Security-Client 头的 port-c（默认 5062）。
 	// 与 SIP 实际监听端口保持一致，>0 时生效。
-	SecurityPortC         int
+	SecurityPortC int
+	// IPsecTransform 非 nil 时在 AKA 成功回调里 Install IMS ipsec-3gpp ESP
+	// 策略（Security-Client/Server 机制对 + CK/IK → port-c↔port-s 选择器）。
+	IPsecTransform *imsipsec.Transform
+	// SecurityPortS 覆盖 Security-Client 头的 port-s（默认 5063）。Vodafone UK
+	// P-CSCF 对 5060 段未保护端口敏感（实测 400 Bad Request），对齐 mdd/1239t
+	// 用随机高段（40000-44999）。
+	SecurityPortS          int
 	Expires               int
 	DisableRefresh        bool
 	RefreshInterval       time.Duration
@@ -87,16 +96,64 @@ func (r WireIMSRegistrar) RegisterIMS(ctx context.Context, cfg IMSRegistrationCo
 		Profile:      profile,
 		RegistrarURI: registrarURI,
 		ContactURI:   contactURI,
-		CallID:       firstRuntimeNonEmpty(r.CallID, cfg.TraceID, cfg.DeviceID+"-ims-register"),
+		// 1239t/v155 Call-ID = 纯 UUID（uuid.NewString）；trace 前缀是私有格式，
+		// 部分 S-CSCF 对非常规 Call-ID 直接 403。
+		CallID:       firstRuntimeNonEmpty(r.CallID, newSIPCallID(), cfg.TraceID),
 		CNonce:       firstRuntimeNonEmpty(r.CNonce, cfg.TraceID, cfg.DeviceID),
 		Expires:      expires,
 	}
+	// Route 头指向 P-CSCF（参考实现 imscore default profile 含 Route <sip:P-CSCF;lr>；
+	// v155 反编译同样存在 "<sip:%s:%d;lr>" 模板）。无 ISIM 时 P-CSCF 只按 Route 寻路。
+	if serverAddr := strings.TrimSpace(r.ServerAddr); serverAddr != "" {
+		registerSession.RouteURI = "sip:" + serverAddr + ";lr"
+	}
+	// 首个 REGISTER 带 aka_empty 占位 Authorization（imscore default 变体先例）：
+	// Vodafone UK P-CSCF 对无 Authorization 的首 REGISTER 回 400。
+	registerSession.InitialAuthorization = "aka_empty"
 	// Security-Client 的 port-c 与实际 SIP socket 端口保持一致：部分运营商
 	// P-CSCF 会把响应发往宣告的保护端口，口径不一致时响应全部落空。
+	// port-s 同步覆盖（默认 5063 落在 P-CSCF 敏感段，实测 400）。
 	if r.SecurityPortC > 0 {
 		agreement := voiceclient.DefaultSecurityClientAgreement(nil)
 		agreement.PortClient = r.SecurityPortC
+		if r.SecurityPortS > 0 {
+			agreement.PortServer = r.SecurityPortS
+		}
 		registerSession.SecurityClient = agreement
+	}
+	if r.IPsecTransform != nil {
+		// TS 33.203 ipsec-3gpp：AKA 成功后用 CK/IK + Security-Client/Server
+		// 机制对在 tun pump 上 Install ESP transform，受保护 REGISTER/后续
+		// SIP 走 port-c↔port-s 的二层加密（明文 CSeq3 实测被 P-CSCF 拒 401）。
+		transform := r.IPsecTransform
+		localIP := net.ParseIP(strings.TrimSpace(profile.LocalIP))
+		remoteIP := ipFromHostPort(r.ServerAddr)
+		if localIP != nil && remoteIP != nil {
+			registerSession.OnSecurityKeys = func(client, server voiceclient.SecurityAgreement, ck, ik []byte) {
+				policy, err := imsipsec.NewPolicy(imsipsec.PolicyInput{
+					LocalIP:    localIP,
+					RemoteIP:   remoteIP,
+					ClientMech: securityAgreementMechanism(client),
+					ServerMech: securityAgreementMechanism(server),
+					CK:         ck,
+					IK:         ik,
+				})
+				if err != nil {
+					fmt.Printf("[imsipsec] policy construct failed: %v\n", err)
+					return
+				}
+				// 重注册/重协商时旧 SA 立即作废：先 Clear 再 Install（P-CSCF 每
+				// 次安全协商换全套 SPI，残留旧 SA 会吞掉新入向包判 replay）。
+				transform.Clear()
+				if err := transform.Install(policy); err != nil {
+					fmt.Printf("[imsipsec] install failed: %v\n", err)
+					return
+				}
+				fmt.Printf("[imsipsec] ESP installed: local=%s remote=%s port-c=%d port-s=%d spi-c=%d spi-s=%d alg=%s/%s\n",
+					localIP, remoteIP, client.PortClient, server.PortServer, client.SPIClient, client.SPIServer,
+					server.Algorithm, server.EncryptionAlgorithm)
+			}
+		}
 	}
 	result, err := registerSession.Register(ctx)
 	if err != nil {
@@ -135,6 +192,32 @@ func (r WireIMSRegistrar) RegisterIMS(ctx context.Context, cfg IMSRegistrationCo
 		Close:          closeRegistration,
 		Recover:        recoverRegistration,
 	}, nil
+}
+
+// securityAgreementMechanism 把 voiceclient 的协商结构转成 imsipsec 机制。
+func securityAgreementMechanism(a voiceclient.SecurityAgreement) imsipsec.Mechanism {
+	return imsipsec.Mechanism{
+		Alg:   a.Algorithm,
+		EAlg:  a.EncryptionAlgorithm,
+		Prot:  a.Prot,
+		Mode:  a.Mod,
+		SPIc:  a.SPIClient,
+		SPIs:  a.SPIServer,
+		PortC: a.PortClient,
+		PortS: a.PortServer,
+	}
+}
+
+func ipFromHostPort(hostPort string) net.IP {
+	hostPort = strings.TrimSpace(hostPort)
+	if hostPort == "" {
+		return nil
+	}
+	host, _, err := net.SplitHostPort(hostPort)
+	if err != nil {
+		host = hostPort
+	}
+	return net.ParseIP(host)
 }
 
 func (r WireIMSRegistrar) voiceTransport(cfg IMSRegistrationConfig, profile voiceclient.IMSProfile, binding voiceclient.RegistrationBinding, fallback voiceclient.SIPRequestTransport) voiceclient.SIPRequestTransport {
@@ -512,6 +595,11 @@ func isRecoverableIMSRegistrationStatus(code int) bool {
 	}
 }
 
+// newSIPCallID 生成 RFC 3261 Call-ID：UUID v4（对齐 1239t registerSession.callID = uuid.NewString()）。
+func newSIPCallID() string {
+	return voiceclient.NewSIPInstanceURN()
+}
+
 func imsRecoveryCallID(base string, n int) string {
 	base = strings.TrimSpace(base)
 	if base == "" {
@@ -626,19 +714,47 @@ func (r WireIMSRegistrar) profileFromConfig(cfg IMSRegistrationConfig) (voicecli
 	}
 	domain := firstRuntimeNonEmpty(preparedIdentity.Domain, defaultIMSRealm(cfg))
 	impi := firstRuntimeNonEmpty(preparedIdentity.IMPI, defaultIMPI(imsi, domain))
+	// 预备阶段的 IMPI 无 ISIM 时是裸 IMSI；digest username 需要 RFC 24.229 的完整
+	// Private Identity（<user>@<realm>），缺域名时补全。
+	if impi != "" && domain != "" && !strings.Contains(impi, "@") {
+		impi = impi + "@" + domain
+	}
 	impu := firstRuntimeNonEmpty(preparedIdentity.IMPU, defaultIMPU(impi, domain))
+	// 无 ISIM 时 identity 预备阶段给出的 IMPU 是裸 "sip:IMSI"（不带域名）。
+	// Vodafone UK 实测 P-CSCF 对无域名的 To/From 不应答（REGISTER 全超时）；
+	// 参考实现（imscore/BuildIMSIdentity）的 IMPU 一律带 home domain。
+	if domain != "" && !strings.Contains(impu, "@") {
+		impu = impu + "@" + domain
+	}
 	if impi == "" {
 		return voiceclient.IMSProfile{}, errors.New("IMS private identity is empty")
 	}
 	if impu == "" {
 		return voiceclient.IMSProfile{}, errors.New("IMS public identity is empty")
 	}
+	// EAP root NAI 需要原始 MNC（"15" 两会变 "015"），不能使用 cfgMCCMNC 的去零版本。
+	mcc := strings.TrimSpace(cfg.Profile.MCC)
+	mnc := strings.TrimSpace(cfg.Profile.MNC)
+	if mcc == "" && len(imsi) >= 3 {
+		mcc = imsi[:3]
+	}
+	if mnc == "" && len(imsi) >= 5 {
+		mnc = imsi[3:5]
+	}
+	imei := strings.TrimSpace(cfg.Profile.IMEI)
+	if imei == "" && cfg.Prepared != nil {
+		imei = strings.TrimSpace(cfg.Prepared.Profile.IMEI)
+	}
 	return voiceclient.IMSProfile{
 		IMPI:      impi,
 		IMPU:      impu,
 		Domain:    domain,
 		LocalIP:   firstRuntimeNonEmpty(r.ContactHost, cfg.Tunnel.LocalInnerIP),
-		UserAgent: firstRuntimeNonEmpty(r.UserAgent, "vowifi-go"),
+		UserAgent: firstRuntimeNonEmpty(r.UserAgent, "SimAdmin VoWiFi"),
+		IMSI:      imsi,
+		MCC:       mcc,
+		MNC:       mnc,
+		IMEI:      imei,
 	}, nil
 }
 
@@ -660,6 +776,10 @@ func (r WireIMSRegistrar) contactURIForProfile(profile voiceclient.IMSProfile) s
 	}
 	if user == "" {
 		user = "ue"
+	}
+	// TCP 模式下 Contact 带 ;transport=tcp（对齐参考 imscore buildHandsetContact）。
+	if strings.EqualFold(strings.TrimSpace(r.Network), "tcp") {
+		return "sip:" + user + "@" + formatSIPHost(host) + ":" + strconv.Itoa(port) + ";transport=tcp"
 	}
 	return "sip:" + user + "@" + formatSIPHost(host) + ":" + strconv.Itoa(port)
 }

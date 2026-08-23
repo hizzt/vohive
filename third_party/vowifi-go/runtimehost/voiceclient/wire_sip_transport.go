@@ -32,6 +32,9 @@ type WireSIPTransport struct {
 	RetransmitInterval    time.Duration
 	MaxRetransmitInterval time.Duration
 	MaxRetransmits        int
+	// OverrideTarget 非空时 TCP 拨号绕过 ServerAddr/URI 解析直连该地址
+	// （ipsec-3gpp 受保护 REGISTER：P-CSCF 的 port-s，1239t dialSecureRegisterConn 语义）。
+	OverrideTarget string
 }
 
 func (t WireSIPTransport) RoundTripRequest(ctx context.Context, msg SIPRequestMessage) (SIPResponse, error) {
@@ -233,6 +236,9 @@ func readFinalSIPResponse(ctx context.Context, reader *bufio.Reader, msg SIPRequ
 		raw, err := readSIPStreamMessage(reader)
 		if err != nil {
 			return SIPResponse{}, err
+		}
+		if os.Getenv("SWU_DEBUG_SIP") != "" {
+			fmt.Fprintf(os.Stderr, "[swu] SIP <- TCP (%d bytes wire)\n---SIP-BEGIN---\n%s\n---SIP-END---\n", len(raw), raw)
 		}
 		resp, err := ParseSIPResponse(raw)
 		if err != nil {

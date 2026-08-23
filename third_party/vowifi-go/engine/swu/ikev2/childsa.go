@@ -1,6 +1,7 @@
 package ikev2
 
 import (
+	"os"
 	"crypto"
 	"errors"
 	"fmt"
@@ -172,6 +173,12 @@ func ParseChildSAResultWithNonces(init InitResult, inner []Payload, localSPI, no
 	out.LocalSPI = append([]byte(nil), localSPI...)
 	out.RemoteSPI = append([]byte(nil), out.SelectedSA.Proposals[0].SPI...)
 	out.Keys = keys
+	if os.Getenv("SWU_DEBUG_ESP") != "" {
+		fmt.Fprintf(os.Stderr, "[swu] child SA: localSPI=%x remoteSPI=%x integID=%d encrLen=%dB integLen=%dB skdLen=%dB outInteg=%dB\n",
+			out.LocalSPI, out.RemoteSPI, keys.Profile.IntegrityID,
+			keys.Profile.EncryptionKeyLength, keys.Profile.IntegrityKeyLength,
+			len(init.Keys.SKD), len(keys.Outbound.IntegrityKey))
+	}
 	return out, nil
 }
 

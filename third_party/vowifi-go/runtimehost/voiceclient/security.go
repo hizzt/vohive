@@ -12,7 +12,11 @@ import (
 const (
 	DefaultSecurityProtocol  = "ipsec-3gpp"
 	DefaultSecurityAlgorithm = "hmac-sha-1-96"
-	DefaultSecurityEAlg      = "null"
+	// ealg=aes-cbc（对齐 v155/参考实现 offer）：Vodafone UK P-CSCF 协商选择
+	// ealg=aes-cbc，offer ealg=null 的首个 REGISTER 被实测静默丢弃（零响应）。
+	DefaultSecurityEAlg      = "aes-cbc"
+	DefaultSecurityProt      = "esp"
+	DefaultSecurityMod       = "trans"
 	DefaultSecurityPortC     = 5062
 	DefaultSecurityPortS     = 5063
 )
@@ -21,6 +25,8 @@ type SecurityAgreement struct {
 	Protocol            string
 	Algorithm           string
 	EncryptionAlgorithm string
+	Prot                string
+	Mod                 string
 	SPIClient           uint32
 	SPIServer           uint32
 	PortClient          int
@@ -42,6 +48,31 @@ func DefaultSecurityClientAgreement(random io.Reader) SecurityAgreement {
 		PortClient:          DefaultSecurityPortC,
 		PortServer:          DefaultSecurityPortS,
 	}
+}
+
+// BuildSecurityClientMultiMechanismHeader 渲染 1239t default 的 6 机制逗号列表
+// （DefaultSecurityClientMechanisms：md5/des、md5/aes、md5/null、sha1/des、sha1/aes、sha1/null），
+// 共用同一对 spi/port。P-CSCF 从中协商选择（Vodafone UK 实测选 sha1+aes-cbc）。
+func BuildSecurityClientMultiMechanismHeader(agreement SecurityAgreement) string {
+	agreement = completeSecurityAgreement(agreement)
+	mechs := [][2]string{
+		{"hmac-md5-96", "des-ede3-cbc"},
+		{"hmac-md5-96", "aes-cbc"},
+		{"hmac-md5-96", "null"},
+		{"hmac-sha-1-96", "des-ede3-cbc"},
+		{"hmac-sha-1-96", "aes-cbc"},
+		{"hmac-sha-1-96", "null"},
+	}
+	parts := make([]string, 0, len(mechs))
+	for _, m := range mechs {
+		parts = append(parts, fmt.Sprintf(
+			"ipsec-3gpp; alg=%s; ealg=%s; spi-c=%d; spi-s=%d; port-c=%d; port-s=%d",
+			m[0], m[1],
+			agreement.SPIClient, agreement.SPIServer,
+			agreement.PortClient, agreement.PortServer,
+		))
+	}
+	return strings.Join(parts, ",")
 }
 
 func BuildSecurityClientHeader(agreement SecurityAgreement) string {
@@ -112,6 +143,11 @@ func (a SecurityAgreement) HeaderValue() string {
 	}
 	if a.PortServer > 0 {
 		parts = append(parts, "port-s="+strconv.Itoa(a.PortServer))
+	}
+	if a.Protocol == DefaultSecurityProtocol && a.Prot == "" && a.Mod == "" {
+		// ipsec-3gpp 标准参数（TS 33.203 Annex H）：prot=esp;mod=trans。
+		// 参考实现（1239t/vowifi-go register_profile.go）与 v155 实测格式。
+		parts = append(parts, "prot="+DefaultSecurityProt, "mod="+DefaultSecurityMod)
 	}
 	return strings.Join(parts, ";")
 }

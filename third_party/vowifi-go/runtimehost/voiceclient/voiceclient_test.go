@@ -162,11 +162,11 @@ func TestBuildRegisterHeaders(t *testing.T) {
 }
 
 func TestParseAndSelectSecurityAgreement(t *testing.T) {
-	values := []string{`ipsec-3gpp;q=0.1;alg=hmac-sha-1-96;ealg=null;spi-c=111;spi-s=222;port-c=5062;port-s=5063, ipsec-3gpp;q=0.9;alg=hmac-md5-96;ealg=null;spi-c=333;spi-s=444;port-c=5064;port-s=5065`}
+	values := []string{`ipsec-3gpp;q=0.1;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=111;spi-s=222;port-c=5062;port-s=5063, ipsec-3gpp;q=0.9;alg=hmac-md5-96;ealg=aes-cbc;spi-c=333;spi-s=444;port-c=5064;port-s=5065`}
 	selected, ok := SelectSecurityAgreement(values, SecurityAgreement{
 		Protocol:            "ipsec-3gpp",
 		Algorithm:           "hmac-md5-96",
-		EncryptionAlgorithm: "null",
+		EncryptionAlgorithm: "aes-cbc",
 	})
 	if !ok {
 		t.Fatal("SelectSecurityAgreement() ok=false")
@@ -176,21 +176,21 @@ func TestParseAndSelectSecurityAgreement(t *testing.T) {
 		t.Fatalf("selected=%+v", selected)
 	}
 	client := BuildSecurityClientHeader(SecurityAgreement{SPIClient: 7001, SPIServer: 7002, PortClient: 6000, PortServer: 6001})
-	if client != "ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=7001;spi-s=7002;port-c=6000;port-s=6001" {
+	if client != "ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=7001;spi-s=7002;port-c=6000;port-s=6001;prot=esp;mod=trans" {
 		t.Fatalf("Security-Client=%q", client)
 	}
 }
 
 func TestSelectSecurityAgreementSkipsIncompatibleOffers(t *testing.T) {
 	values := []string{
-		`tls;q=1.0;alg=hmac-sha-1-96;ealg=null;spi-c=900;spi-s=901;port-c=5070;port-s=5071`,
-		`ipsec-3gpp;q=0.1;alg=hmac-sha-1-96;ealg=null;spi-c=111;spi-s=222;port-c=5062;port-s=5063`,
-		`ipsec-3gpp;q=0.9;alg=hmac-md5-96;ealg=null;spi-c=333;spi-s=444;port-c=5064;port-s=5065`,
+		`tls;q=1.0;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=900;spi-s=901;port-c=5070;port-s=5071`,
+		`ipsec-3gpp;q=0.1;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=111;spi-s=222;port-c=5062;port-s=5063`,
+		`ipsec-3gpp;q=0.9;alg=hmac-md5-96;ealg=aes-cbc;spi-c=333;spi-s=444;port-c=5064;port-s=5065`,
 	}
 	selected, ok := SelectSecurityAgreement(values, SecurityAgreement{
 		Protocol:            "ipsec-3gpp",
 		Algorithm:           "hmac-sha-1-96",
-		EncryptionAlgorithm: "null",
+		EncryptionAlgorithm: "aes-cbc",
 	})
 	if !ok {
 		t.Fatal("SelectSecurityAgreement() ok=false")
@@ -200,9 +200,9 @@ func TestSelectSecurityAgreementSkipsIncompatibleOffers(t *testing.T) {
 	}
 
 	if selected, ok := SelectSecurityAgreement([]string{
-		`tls;q=1.0;alg=hmac-sha-1-96;ealg=null;spi-c=900;spi-s=901`,
-		`ipsec-3gpp;q=0.9;alg=hmac-md5-96;ealg=null;spi-c=333;spi-s=444`,
-	}, SecurityAgreement{Protocol: "ipsec-3gpp", Algorithm: "hmac-sha-1-96", EncryptionAlgorithm: "null"}); ok {
+		`tls;q=1.0;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=900;spi-s=901`,
+		`ipsec-3gpp;q=0.9;alg=hmac-md5-96;ealg=aes-cbc;spi-c=333;spi-s=444`,
+	}, SecurityAgreement{Protocol: "ipsec-3gpp", Algorithm: "hmac-sha-1-96", EncryptionAlgorithm: "aes-cbc"}); ok {
 		t.Fatalf("SelectSecurityAgreement() selected incompatible offer: %+v", selected)
 	}
 }
@@ -216,7 +216,7 @@ func TestRegisterSessionHandlesAKAv1MD5Challenge(t *testing.T) {
 			Reason:     "Unauthorized",
 			Headers: map[string][]string{
 				"WWW-Authenticate": {challenge},
-				"Security-Server":  {`ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=111;spi-s=222;port-c=5062;port-s=5063`},
+				"Security-Server":  {`ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=111;spi-s=222;port-c=5062;port-s=5063`},
 			},
 		},
 		{
@@ -300,7 +300,7 @@ func TestRegisterSessionHandlesAKASynchronizationFailure(t *testing.T) {
 			Reason:     "Unauthorized",
 			Headers: map[string][]string{
 				"WWW-Authenticate": {firstChallenge},
-				"Security-Server":  {`ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=111;spi-s=222;port-c=5062;port-s=5063`},
+				"Security-Server":  {`ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=111;spi-s=222;port-c=5062;port-s=5063`},
 			},
 		},
 		{
@@ -308,7 +308,7 @@ func TestRegisterSessionHandlesAKASynchronizationFailure(t *testing.T) {
 			Reason:     "Unauthorized",
 			Headers: map[string][]string{
 				"WWW-Authenticate": {secondChallenge},
-				"Security-Server":  {`ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=333;spi-s=444;port-c=5064;port-s=5065`},
+				"Security-Server":  {`ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=333;spi-s=444;port-c=5064;port-s=5065`},
 			},
 		},
 		{
@@ -415,7 +415,7 @@ func TestRegisterSessionRetriesAuthenticatedMinExpires(t *testing.T) {
 			Reason:     "Unauthorized",
 			Headers: map[string][]string{
 				"WWW-Authenticate": {`Digest realm="ims.example", nonce="nonce-auth-min", algorithm=MD5, qop="auth"`},
-				"Security-Server":  {`ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=555;spi-s=666`},
+				"Security-Server":  {`ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=555;spi-s=666`},
 			},
 		},
 		{
@@ -547,7 +547,7 @@ func TestRegisterSessionDeregisterRetriesDigestChallenge(t *testing.T) {
 			Reason:     "Unauthorized",
 			Headers: map[string][]string{
 				"WWW-Authenticate": {`Digest realm="ims.example", nonce="nonce-dereg", algorithm=MD5, qop="auth"`},
-				"Security-Server":  {`ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=701;spi-s=702;port-c=5068;port-s=5069`},
+				"Security-Server":  {`ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=701;spi-s=702;port-c=5068;port-s=5069`},
 			},
 		},
 		{StatusCode: 200, Reason: "OK"},
@@ -563,8 +563,8 @@ func TestRegisterSessionDeregisterRetriesDigestChallenge(t *testing.T) {
 	result, err := session.Deregister(context.Background(), DeregisterRequest{
 		Binding: RegistrationBinding{
 			ContactURI:     "sip:user@192.0.2.10:5060",
-			SecurityClient: "ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=101;spi-s=102;port-c=5062;port-s=5063",
-			SecurityVerify: []string{"ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=501;spi-s=502;port-c=5064;port-s=5065"},
+			SecurityClient: "ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=101;spi-s=102;port-c=5062;port-s=5063",
+			SecurityVerify: []string{"ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=501;spi-s=502;port-c=5064;port-s=5065"},
 		},
 		CSeq: 9,
 	})
@@ -579,7 +579,7 @@ func TestRegisterSessionDeregisterRetriesDigestChallenge(t *testing.T) {
 	}
 	first := transport.requests[0].Headers
 	if first["Expires"] != "0" || first["CSeq"] != "9 REGISTER" || !strings.Contains(first["Contact"], "expires=0") ||
-		first["Security-Client"] != "ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=101;spi-s=102;port-c=5062;port-s=5063" ||
+		first["Security-Client"] != "ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=101;spi-s=102;port-c=5062;port-s=5063" ||
 		!strings.Contains(first["Security-Verify"], "spi-c=501") {
 		t.Fatalf("first deregister headers=%+v", first)
 	}
@@ -610,8 +610,8 @@ func TestRegisterSessionRefreshUsesExistingBindingAndAuth(t *testing.T) {
 		Binding: RegistrationBinding{
 			ContactURI:     "sip:user@192.0.2.10:5060",
 			Expires:        1200,
-			SecurityClient: "ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=101;spi-s=102;port-c=5062;port-s=5063",
-			SecurityVerify: []string{"ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=501;spi-s=502;port-c=5064;port-s=5065"},
+			SecurityClient: "ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=101;spi-s=102;port-c=5062;port-s=5063",
+			SecurityVerify: []string{"ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=501;spi-s=502;port-c=5064;port-s=5065"},
 		},
 		CSeq:           7,
 		AuthHeader:     `Digest username="impi@example"`,
@@ -642,7 +642,7 @@ func TestRegisterSessionRefreshAndDeregisterAdvanceDigestNonceCount(t *testing.T
 			Reason:     "Unauthorized",
 			Headers: map[string][]string{
 				"WWW-Authenticate": {challenge},
-				"Security-Server":  {`ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=701;spi-s=702;port-c=5068;port-s=5069`},
+				"Security-Server":  {`ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=701;spi-s=702;port-c=5068;port-s=5069`},
 			},
 		},
 		{
@@ -851,7 +851,7 @@ func TestRegisterSessionRefreshRetriesDigestChallenge(t *testing.T) {
 			Reason:     "Unauthorized",
 			Headers: map[string][]string{
 				"WWW-Authenticate": {`Digest realm="ims.example", nonce="nonce-refresh", algorithm=MD5, qop="auth"`},
-				"Security-Server":  {`ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=701;spi-s=702;port-c=5068;port-s=5069`},
+				"Security-Server":  {`ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=701;spi-s=702;port-c=5068;port-s=5069`},
 			},
 		},
 		{
@@ -874,7 +874,7 @@ func TestRegisterSessionRefreshRetriesDigestChallenge(t *testing.T) {
 		Binding: RegistrationBinding{
 			ContactURI:     "sip:user@192.0.2.10:5060",
 			Expires:        600,
-			SecurityClient: "ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=101;spi-s=102;port-c=5062;port-s=5063",
+			SecurityClient: "ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=101;spi-s=102;port-c=5062;port-s=5063",
 		},
 		CSeq: 11,
 	})
@@ -965,7 +965,7 @@ func TestBuildRegistrationBindingParsesIMSHeaders(t *testing.T) {
 			"P-Associated-URI": {`"User, One" <sip:user@example>, <tel:+18005551212>`},
 			"Service-Route":    {`<sip:pcscf1.example;lr>, <sip:pcscf2.example;lr>`},
 			"Path":             {`<sip:path.example;lr>`},
-			"Security-Server":  {`ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=1;spi-s=2`},
+			"Security-Server":  {`ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=1;spi-s=2`},
 			"Expires":          {`3600`},
 			"Contact":          {`<sip:other@192.0.2.20:5060>;expires=111, <sip:user@192.0.2.10:5060;transport=udp>;expires=777`},
 		},
@@ -1014,7 +1014,7 @@ func TestBuildIMSDialogRequestsUseRegistrationRouteSet(t *testing.T) {
 			ContactURI:     "sip:user@192.0.2.10:5060",
 			PublicIdentity: "sip:user@example",
 			ServiceRoutes:  []string{"<sip:pcscf1.example;lr>", "<sip:pcscf2.example;lr>"},
-			SecurityVerify: []string{"ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=111;spi-s=222;port-c=5062;port-s=5063"},
+			SecurityVerify: []string{"ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=111;spi-s=222;port-c=5062;port-s=5063"},
 		},
 		RemoteURI:       "sip:+18005551212@ims.example",
 		RemoteTargetURI: "sip:+18005551212@pcscf.example",

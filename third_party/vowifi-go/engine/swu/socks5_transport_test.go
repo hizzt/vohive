@@ -1,6 +1,7 @@
 package swu
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -13,6 +14,18 @@ import (
 
 	"github.com/iniwex5/vowifi-go/engine/swu/ikev2"
 )
+
+// waitFor 轮询等待 cond 成立（100ms 间隔，2s 上限）。
+func waitFor(cond func() bool) error {
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return fmt.Errorf("condition not met within 2s")
+}
 
 // mockSocks5Server 模拟 SOCKS5 UDP Associate 代理 + ePDG 回声。
 type mockSocks5Server struct {
@@ -28,6 +41,8 @@ type mockSocks5Server struct {
 	dropFirst int32 // ePDG 丢弃前 N 个包（模拟丢包，atomic）
 	rxCount   int32 // ePDG 已收包计数（atomic）
 	tcpConns  int32 // TCP 控制连接计数（验证 associate 只建一次，atomic）
+
+	lastESP []byte // ePDG 最近收到的一帧 ESP 载荷（含 marker 前缀，供断言）
 }
 
 // TestSocks5UDPTransport_Retransmit 验证读超时重传：ePDG 丢前 1 个包，
@@ -236,6 +251,12 @@ func (s *mockSocks5Server) serveEPDG(ctx context.Context) {
 		if err != nil {
 			return
 		}
+		// 记录最近一帧非 IKE 载荷（SendESPPacket 发出的 ESP 帧），供 marker 断言。
+		if !looksLikeIKE(buf[:n]) {
+			s.mu.Lock()
+			s.lastESP = append([]byte(nil), buf[:n]...)
+			s.mu.Unlock()
+		}
 		payload := make([]byte, n+5)
 		copy(payload, buf[:n])
 		for i := 0; i < n; i++ {
@@ -318,6 +339,52 @@ func TestSocks5UDPTransport_ESP(t *testing.T) {
 	expected := "ESP_DATA!EPDG"
 	if string(resp) != expected {
 		t.Fatalf("ESP 响应不匹配: got=%q want=%q", resp, expected)
+	}
+}
+
+func TestSocks5UDPTransport_ESPNATTMarker(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	srv, err := startMockSocks5Server(ctx)
+	if err != nil {
+		t.Fatalf("mock server start: %v", err)
+	}
+	defer srv.close()
+
+	transport := NewSocks5UDPTransport(ProxyConfig{Addr: srv.tcpAddr, Enabled: true}, []string{srv.epdg}, "", 5*time.Second)
+
+	if _, err := transport.ExchangeIKE(ctx, []byte("IKE_INIT")); err != nil {
+		t.Fatalf("ExchangeIKE: %v", err)
+	}
+
+	espFrame := []byte{0x12, 0x34, 0x56, 0x78, 0, 0, 0, 1, 0xaa, 0xbb}
+	// 非 NAT-T：裸 ESP 帧发送。
+	if err := transport.SendESPPacket(ctx, espFrame); err != nil {
+		t.Fatalf("SendESPPacket: %v", err)
+	}
+	if err := waitFor(func() bool {
+		srv.mu.Lock()
+		defer srv.mu.Unlock()
+		return srv.lastESP != nil && bytes.Equal(srv.lastESP, espFrame)
+	}); err != nil {
+		t.Fatalf("非 NAT-T 帧应为裸 ESP: %v", err)
+	}
+	// NAT-T 开启后：上行仍裸发——本链路（伦敦 relay）实测 ePDG 只接受裸 ESP，
+	// 加 4B marker 会被当 NAT-T 前缀剥掉导致 SPI 错位静默丢包（v155 同链路对照）。
+	transport.SwitchToNATT()
+	if err := transport.SendESPPacket(ctx, espFrame); err != nil {
+		t.Fatalf("SendESPPacket (NAT-T): %v", err)
+	}
+	if err := waitFor(func() bool {
+		srv.mu.Lock()
+		defer srv.mu.Unlock()
+		return srv.lastESP != nil && bytes.Equal(srv.lastESP, espFrame)
+	}); err != nil {
+		srv.mu.Lock()
+		got := append([]byte(nil), srv.lastESP...)
+		srv.mu.Unlock()
+		t.Fatalf("NAT-T 帧应裸 ESP: got=%x", got)
 	}
 }
 

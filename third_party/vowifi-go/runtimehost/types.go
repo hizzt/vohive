@@ -15,6 +15,7 @@ import (
 	"github.com/iniwex5/vowifi-go/engine/swu"
 	"github.com/iniwex5/vowifi-go/runtimehost/eventhost"
 	"github.com/iniwex5/vowifi-go/runtimehost/identity"
+	"github.com/iniwex5/vowifi-go/runtimehost/imsipsec"
 	"github.com/iniwex5/vowifi-go/runtimehost/messaging"
 	"github.com/iniwex5/vowifi-go/runtimehost/voiceclient"
 	"github.com/iniwex5/vowifi-go/runtimehost/voicehost"
@@ -255,6 +256,10 @@ type StartRequest struct {
 	// 经隧道收发需要 LocalInnerIP（tun0 内网地址）/P-CSCF 等只在运行时
 	// 已知的参数。设置时优先于 IMSRegistrar。
 	IMSRegistrarFactory func(StartRequest, swu.TunnelResult) IMSRegistrar
+	// IMSIPsecTransform 挂在 tun pump 收发路径上的 IMS ipsec-3gpp ESP
+	// 变换（TS 33.203）。非 nil 时传入 TUN tunnel manager 的 PacketPump，
+	// 并可被 registrar 工厂用于在 AKA 成功后 Install 协商出的 SA。
+	IMSIPsecTransform        *imsipsec.Transform
 	VoiceTransport             voiceclient.SIPRequestTransport
 	VoiceUserAgent             string
 	VoiceSessionExpires        int
@@ -823,12 +828,19 @@ func (i *Instance) startSIPKeepaliveLoop(ctx context.Context) {
 				i.mu.RLock()
 				dead := i.stopped
 				keeper, _ := i.voice.(voicehost.SIPKeepaliveSender)
+				crlfKeeper, _ := i.voice.(voicehost.SIPCRLFKeepaliveSender)
 				i.mu.RUnlock()
-				if dead || keeper == nil {
+				if dead || (keeper == nil && crlfKeeper == nil) {
 					continue
 				}
 				probeCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-				err := keeper.SendKeepaliveOptions(probeCtx)
+				// CRLF 优先（v155 实证形态，4 字节零事务）；不支持时退 OPTIONS。
+				var err error
+				if crlfKeeper != nil {
+					err = crlfKeeper.SendKeepaliveCRLF(probeCtx)
+				} else {
+					err = keeper.SendKeepaliveOptions(probeCtx)
+				}
 				cancel()
 				if err == nil {
 					consecutiveFailures = 0
@@ -843,7 +855,7 @@ func (i *Instance) startSIPKeepaliveLoop(ctx context.Context) {
 				// 仅首个失败上报（后续失败静默，避免面板日志刷屏；恢复
 				// 由 liveness 拆链重建兜底）。
 				if consecutiveFailures == 1 {
-					fmt.Fprintf(os.Stderr, "[runtimehost] SIP OPTIONS keepalive failed (%v), muting until recovered\n", err)
+					fmt.Fprintf(os.Stderr, "[runtimehost] SIP keepalive failed (%v), muting until recovered\n", err)
 				}
 			}
 		}
@@ -1402,6 +1414,13 @@ func defaultTunnelManagerForStart(req StartRequest) (swu.TunnelManager, error) {
 	if req.SIM == nil {
 		return nil, errors.New("SWU tunnel manager requires SIM AKA provider")
 	}
+	tunMTU := req.Dataplane.TUNMTU
+	if tunMTU <= 0 {
+		// IMS ipsec-3gpp ESP(+66B) 叠加在 tun 内层包上：MTU 1500 时 SIP 段
+		// 1410B 封装后 1516B 超 MTU 被路径丢弃（设备实测 P-CSCF 永远收不齐
+		// 首段只能 SACK 尾段），1400 保证封装后 ≤1486B。
+		tunMTU = 1400
+	}
 	return swu.NewTUNIKETunnelManager(
 		swu.IKEPacketTunnelManagerConfig{
 			SIM:                     req.SIM,
@@ -1410,10 +1429,11 @@ func defaultTunnelManagerForStart(req StartRequest) (swu.TunnelManager, error) {
 		},
 		swu.TUNTunnelManagerConfig{
 			TUN:                 swu.TUNDeviceConfig{Name: strings.TrimSpace(req.Dataplane.TUNName)},
+			Transform:           req.IMSIPsecTransform,
 			DisableRouting:      req.Dataplane.DisableTUNRouting,
 			DefaultRoutes:       true,
 			ProtectEPDGRoutes:   true,
-			MTU:                 req.Dataplane.TUNMTU,
+			MTU:                 tunMTU,
 			Addresses:           append([]string(nil), req.Dataplane.TUNAddresses...),
 			EPDGRouteExclusions: cloneRuntimeEPDGRouteExclusions(req.Dataplane.TUNEPDGExclusions),
 			Routes:              append([]swu.TUNRoute(nil), req.Dataplane.TUNRoutes...),

@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -21,6 +23,8 @@ type WireSIPFlow struct {
 	RetransmitInterval    time.Duration
 	MaxRetransmitInterval time.Duration
 	MaxRetransmits        int
+	// OverrideTarget 非空时直连该地址（ipsec-3gpp 受保护 REGISTER → P-CSCF port-s）。
+	OverrideTarget string
 
 	mu          sync.Mutex
 	conn        net.Conn
@@ -302,6 +306,9 @@ func (f *WireSIPFlow) readUDPResponseLocked(ctx context.Context, conn net.Conn, 
 		if !isSIPResponseWire(buf[:n]) {
 			continue
 		}
+		if os.Getenv("SWU_DEBUG_SIP") != "" {
+			fmt.Fprintf(os.Stderr, "[swu] SIP <- (%d bytes wire)\n---SIP-BEGIN---\n%s\n---SIP-END---\n", n, buf[:n])
+		}
 		resp, err := ParseSIPResponse(buf[:n])
 		if err != nil {
 			return SIPResponse{}, err
@@ -330,8 +337,49 @@ func (f *WireSIPFlow) ensureConnLocked(ctx context.Context, msg SIPRequestMessag
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
-	if f.conn != nil && f.network == network && (strings.TrimSpace(f.ServerAddr) == "" || f.target == strings.TrimSpace(f.ServerAddr)) {
+	wantTarget := strings.TrimSpace(f.ServerAddr)
+	if override := strings.TrimSpace(f.OverrideTarget); override != "" && strings.HasPrefix(network, "tcp") {
+		wantTarget = override
+	}
+	if f.conn != nil && f.network == network && (wantTarget == "" || f.target == wantTarget) {
 		return f.conn, network, timeout, nil
+	}
+	if override := strings.TrimSpace(f.OverrideTarget); override != "" && strings.HasPrefix(network, "tcp") {
+		// 受保护 REGISTER（TS 33.203）：P-CSCF port-s 上建立的长连接跨
+		// re-REGISTER 复用（SA 换装不影响 TCP 连接本身，seq 由 SA 各自维护）
+		// ——v155 行为对齐：连接活着就不重建，避免运营商侧可见的周期性
+		// RST+重拨指纹。仅当无连接/目标变化时拨新连接：从 port-c 源端口
+		// 拨（ESP 选择器按 Security-Client 宣告的 port-c 匹配）；关旧连接
+		// 置 SO_LINGER=0 走 RST，port-c 立即可重绑。
+		if f.conn != nil && f.target == override {
+			return f.conn, network, timeout, nil
+		}
+		if f.conn != nil {
+			_ = f.closeConnLocked()
+		}
+		conn, err := sipDialFunc(ctx, network, override, f.LocalAddr, timeout)
+		if err != nil {
+			if os.Getenv("SWU_DEBUG_IMSIPSEC") != "" {
+				fmt.Fprintf(os.Stderr, "[imsipsec] protected dial %s bind %s failed: %v\n", override, f.LocalAddr, err)
+			}
+			// port-c 重绑失败（TIME_WAIT/冲突）→ 随机源端口仍能完成注册，
+			// 但 ESP 选择器不会命中——记录在 dial error 里由上层观察。
+			conn, err = sipDialFunc(ctx, network, override, "", timeout)
+		}
+		if err != nil {
+			if os.Getenv("SWU_DEBUG_IMSIPSEC") != "" {
+				fmt.Fprintf(os.Stderr, "[imsipsec] protected dial %s failed, fallback plaintext server addr\n", override)
+			}
+			conn, err = sipDialFunc(ctx, network, strings.TrimSpace(f.ServerAddr), f.LocalAddr, timeout)
+			if err != nil {
+				return nil, "", 0, err
+			}
+		}
+		f.conn = conn
+		f.network = network
+		f.target = override
+		f.reader = bufio.NewReader(conn)
+		return conn, network, timeout, nil
 	}
 	targets, err := f.ensureTargetsLocked(ctx, network, msg.URI)
 	if err != nil {
@@ -403,6 +451,11 @@ func (f *WireSIPFlow) closeConnLocked() error {
 		f.network = ""
 		f.target = ""
 		return nil
+	}
+	// 置 SO_LINGER=0 再关：TCP 走 RST 复位而非四次挥手，本地端口不进
+	// TIME_WAIT——port-c 随后的受保护重拨才能重绑同端口（ESP 选择器前提）。
+	if tcp, ok := f.conn.(*net.TCPConn); ok {
+		_ = tcp.SetLinger(0)
 	}
 	err := f.conn.Close()
 	f.conn = nil

@@ -199,6 +199,9 @@ func (t WireRegisterTransport) roundTripTCP(ctx context.Context, network, target
 	if err != nil {
 		return RegisterResponse{}, err
 	}
+	if os.Getenv("SWU_DEBUG_SIP") != "" {
+		fmt.Fprintf(os.Stderr, "[swu] SIP <- TCP (%d bytes wire)\n---SIP-BEGIN---\n%s\n---SIP-END---\n", len(raw), raw)
+	}
 	return ParseSIPResponse(raw)
 }
 
@@ -307,7 +310,8 @@ func buildViaHeader(transport string, addr net.Addr) string {
 	if port == 0 {
 		port = 5060
 	}
-	return "SIP/2.0/" + strings.ToUpper(strings.TrimSpace(transport)) + " " + host + ":" + strconv.Itoa(port) + ";branch=" + newBranch() + ";rport"
+	// 1239t formatRegisterViaHost 不带 rport 参数——对齐参考实现。
+	return "SIP/2.0/" + strings.ToUpper(strings.TrimSpace(transport)) + " " + host + ":" + strconv.Itoa(port) + ";branch=" + newBranch()
 }
 
 func localHostPort(addr net.Addr) (string, int) {

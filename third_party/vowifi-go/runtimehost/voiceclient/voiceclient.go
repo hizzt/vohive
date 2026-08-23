@@ -1,6 +1,8 @@
 package voiceclient
 
 import (
+	"net"
+	cryptorand "crypto/rand"
 	"context"
 	"crypto/hmac"
 	"crypto/md5"
@@ -25,6 +27,15 @@ type IMSProfile struct {
 	Domain    string
 	LocalIP   string
 	UserAgent string
+	// IMSI 用于派生 EAP root NAI（0<IMSI>@nai.epc.mnc<MNC3>.mcc<MCC>.3gppnetwork.org）。
+	// 1239t/v155 默认 REGISTER 的 digest username 用的是 EAP NAI 而非裸 IMSI/IMPI。
+	IMSI string
+	MCC  string
+	MNC  string
+	// IMEI 用于派生 GSMA sip.instance（urn:gsma:imei:TAC-SNR-SV）。v155 逆串
+	// 存在 "<urn:gsma:imei:%s-%s-%s>" 模板 + sip_instance_imei 模板开关：
+	// 运营商 S-CSCF 按 IMEI instance 做 UE 合法性校验（非 UUID instance）。
+	IMEI string
 }
 
 type DigestChallenge struct {
@@ -46,6 +57,10 @@ type DigestAuthInput struct {
 	NC       int
 	Body     []byte
 	AUTS     []byte
+	// AKA CK/IK：AKA 成功时由 digestAuthInputForChallenge 填充，供
+	// OnSecurityKeys 派生 IMS ipsec-3gpp ESP 密钥（TS 33.203）。
+	AKACK []byte
+	AKAIK []byte
 }
 
 type DigestAuthState struct {
@@ -93,11 +108,21 @@ type RegisterSession struct {
 	Profile        IMSProfile
 	RegistrarURI   string
 	ContactURI     string
-	CallID         string
-	CNonce         string
-	Expires        int
-	SecurityClient SecurityAgreement
-	SecurityRandom io.Reader
+	RouteURI       string
+	// InitialAuthorization 首个 REGISTER 的 Authorization 头模式：
+	// ""（无）/ "aka_empty"（Digest 占位 nonce="" response="" AKAv1-MD5）。
+	// 参考实现（imscore）default 变体以 aka_empty 打头——部分 P-CSCF 只回
+	// 带占位 Authorization 的首个 REGISTER。
+	InitialAuthorization string
+	CallID               string
+	CNonce               string
+	Expires              int
+	SecurityClient       SecurityAgreement
+	SecurityRandom       io.Reader
+	// OnSecurityKeys 在每次 AKA 成功（拿到 CK/IK 且未处同步失败）后、发送受保护
+	// REGISTER 前同步调用——上层在此 Install IMS ipsec-3gpp ESP transform
+	// （Security-Client/Server 机制对 + CK/IK 即 TS 33.203 全部协商要素）。
+	OnSecurityKeys func(client SecurityAgreement, server SecurityAgreement, ck []byte, ik []byte)
 }
 
 type RegisterResult struct {
@@ -365,17 +390,30 @@ func BuildRegisterHeaders(profile IMSProfile, contactURI, callID, cseq string) m
 	}
 	headers := map[string]string{
 		"To":                   "<" + impu + ">",
-		"From":                 "<" + impu + ">;tag=vowifi-go",
-		"Contact":              "<" + strings.TrimSpace(contactURI) + ">;+sip.instance=\"<urn:uuid:vowifi-go>\"",
+		"From":                 "<" + impu + ">;tag=" + GenerateSIPTag(),
+		"Contact":              buildRegisterContactHeader(profile, contactURI),
 		"Call-ID":              strings.TrimSpace(callID),
 		"CSeq":                 strings.TrimSpace(cseq) + " REGISTER",
 		"Max-Forwards":         "70",
-		"User-Agent":           firstNonEmpty(profile.UserAgent, "vowifi-go"),
-		"Allow":                "INVITE, ACK, CANCEL, BYE, PRACK, UPDATE, INFO, MESSAGE, OPTIONS",
-		"Supported":            "path, gruu, outbound, sec-agree, 100rel, timer",
+		"User-Agent":           firstNonEmpty(profile.UserAgent, "SimAdmin VoWiFi"),
+		"Allow":                "INVITE,ACK,CANCEL,BYE,UPDATE,PRACK,MESSAGE,REFER,NOTIFY,INFO,OPTIONS",
+		"Supported":            "path,sec-agree,gruu",
+		// Vodafone UK P-CSCF 对缺 Require: sec-agree 的 REGISTER 回 421 Extension Required
+		// 并在响应里明示 Require: sec-agree（0823r 实测）——必须带。
 		"Require":              "sec-agree",
+		"Proxy-Require":        "sec-agree",
 		"P-Preferred-Identity": "<" + impu + ">",
-		"Security-Client":      BuildSecurityClientHeader(DefaultSecurityClientAgreement(nil)),
+		// VoCat（Vodafone UK 生产验证）PANI 形态："IEEE-802.11;country=GB"——
+		// 由 SIM MCC 组合 country；v155 逆串另有 "IEEE-802.11; i-wlan-node-id=000000000000"
+		// 变体。country 码是 Vodafone P-CSCF 鉴权判定的关键字段。
+		"P-Access-Network-Info": buildPANIHeader(profile),
+		"P-Visited-Network-ID":  "\"" + domain + "\"",
+		"Security-Client":       BuildSecurityClientMultiMechanismHeader(DefaultSecurityClientAgreement(nil)),
+	}
+	if domain != "" {
+		// 1239t IncludeAcceptContact 是两条 Accept-Contact（smsip + mmtel ICSI）；
+		// 本结构 map 单值，按 RFC 3261 逗号合并语义等价。
+		headers["Accept-Contact"] = "*;+g.3gpp.smsip, *;+g.3gpp.icsi-ref=\"" + imsMmtelICSIRefURNEscaped + "\""
 	}
 	return headers
 }
@@ -409,8 +447,16 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 		}
 		msg.Headers["Expires"] = strconv.Itoa(expires)
 		msg.Headers["Security-Client"] = securityClientHeader
+		// 服务端 401 挑战携带的 Security-Server 生效后，Route 按 P-CSCF 要求
+		// 指向其保护端口（port-s）；首轮无挑战信息时用初始 RouteURI（P-CSCF:5060）。
+		if route := routeHeaderForChallenge(s.RouteURI, challengeHeaders); route != "" {
+			msg.Headers["Route"] = route
+		}
 		if strings.TrimSpace(authHeaderName) != "" && strings.TrimSpace(authz) != "" {
 			msg.Headers[authHeaderName] = authz
+		} else if attempts == 0 && strings.EqualFold(strings.TrimSpace(s.InitialAuthorization), "aka_empty") {
+			// aka_empty 变体（imscore 先例）：带占位 Digest 的首 REGISTER。
+			msg.Headers["Authorization"] = BuildInitialAKAEmptyAuthorization(s.Profile, registrarURI)
 		}
 		if securityVerify := securityVerifyFromChallenge(challengeHeaders); securityVerify != "" {
 			msg.Headers["Security-Verify"] = securityVerify
@@ -487,6 +533,20 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 		return RegisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: attempts, Challenge: ch}, err
 	}
 
+	// 受保护 REGISTER（TS 33.203）：401 的 Security-Server 宣告 port-s 后，
+	// 鉴权 REGISTER 必须从 port-c 源端口发往 P-CSCF 的 port-s（1239t
+	// dialSecureRegisterConn 同构）。Route 集保持首轮原样。
+	// 仅 AKA 成功（CK/IK 已出）才切受保护端口——AUTS 重同步轮的 CSeq2
+	// 走原明文连接（P-CSCF 对未完成安全协商的明文请求在 5060 应答；
+	// 过早拨 port-s 实测无 ESP 可封装，连接失败回退明文被拒 same-nonce）。
+	if len(authzInput.AKACK) > 0 && len(authzInput.AKAIK) > 0 {
+		s.notifySecurityKeys(securityHeaders, authzInput)
+		if flow, ok := s.Transport.(*WireSIPFlow); ok {
+			if target := protectedTargetFromChallenge(s.RouteURI, securityHeaders); target != "" {
+				flow.OverrideTarget = target
+			}
+		}
+	}
 	cseq++
 	resp2, err := sendRegister(cseq, authzHeader, authz, resp.Headers)
 	if err != nil {
@@ -542,6 +602,15 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 		authz, err = BuildDigestAuthorization(nextChallenge, nextAuthInput)
 		if err != nil {
 			return RegisterResult{StatusCode: resp2.StatusCode, Reason: resp2.Reason, Attempts: attempts, Challenge: nextChallenge, AuthHeader: authz}, err
+		}
+		// 重同步后的 AKA 成功——CK/IK 是本套 SA 的最终密钥材料。
+		s.notifySecurityKeys(resp2.Headers, nextAuthInput)
+		if len(nextAuthInput.AKACK) > 0 && len(nextAuthInput.AKAIK) > 0 {
+			if flow, ok := s.Transport.(*WireSIPFlow); ok {
+				if target := protectedTargetFromChallenge(s.RouteURI, resp2.Headers); target != "" {
+					flow.OverrideTarget = target
+				}
+			}
 		}
 		ch = nextChallenge
 		authzHeader = nextAuthzHeader
@@ -953,9 +1022,11 @@ func mergeRefreshBinding(previous, next RegistrationBinding) RegistrationBinding
 
 func (s RegisterSession) digestAuthInputForChallenge(ch DigestChallenge, registrarURI string) (DigestAuthInput, bool, error) {
 	input := DigestAuthInput{
-		Method:   "REGISTER",
-		URI:      registrarURI,
-		Username: firstNonEmpty(s.Profile.IMPI, s.Profile.IMPU),
+		Method: "REGISTER",
+		URI:    registrarURI,
+		// digest username 与首个 REGISTER 占位同源：标准 IMPI 优先（Vodafone UK
+		// S-CSCF HSS 用户键），EAP NAI 兜底。
+		Username: firstNonEmpty(s.Profile.IMPI, BuildEAPRootNAI(s.Profile), s.Profile.IMPU),
 		CNonce:   firstNonEmpty(s.CNonce, "vowifi-go"),
 		NC:       1,
 	}
@@ -980,12 +1051,36 @@ func (s RegisterSession) digestAuthInputForChallenge(ch DigestChallenge, registr
 	if err != nil {
 		return input, false, err
 	}
+	// APDU 后端（0xDC）以「nil 错误 + 非空 AUTS」表达同步失败——按 AUTS 在场判
+	// 定，否则走到 BuildAKADigestPassword 才以 "AKA RES is empty" 失败。
+	if len(aka.AUTS) > 0 {
+		input.AUTS = append([]byte(nil), aka.AUTS...)
+		return input, true, nil
+	}
 	password, err := BuildAKADigestPassword(ch.Algorithm, aka)
 	if err != nil {
 		return input, false, err
 	}
 	input.Password = password
+	input.AKACK = append([]byte(nil), aka.CK...)
+	input.AKAIK = append([]byte(nil), aka.IK...)
 	return input, false, nil
+}
+
+// notifySecurityKeys 在 AKA 成功（DigestAuthInput 带 CK/IK）后把安全协商
+// 完整要素上抛给 OnSecurityKeys：UE 侧 Security-Client 机制 + P-CSCF 的
+// Security-Server 机制 + CK/IK。注册失败/无回调/同步失败轮次静默跳过。
+func (s RegisterSession) notifySecurityKeys(challengeHeaders map[string][]string, input DigestAuthInput) {
+	if s.OnSecurityKeys == nil || len(input.AKACK) == 0 || len(input.AKAIK) == 0 {
+		return
+	}
+	serverValues := trimHeaderValues(headerListValues(challengeHeaders, "Security-Server"))
+	serverAgreements := ParseSecurityAgreements(serverValues)
+	if len(serverAgreements) == 0 {
+		return
+	}
+	// P-CSCF 选择以首条 Security-Server 机制为准（实测 Vodafone UK 单条）。
+	s.OnSecurityKeys(s.SecurityClient, serverAgreements[0], input.AKACK, input.AKAIK)
 }
 
 func SelectDigestChallenge(headers map[string][]string, name string) (DigestChallenge, error) {
@@ -1410,6 +1505,66 @@ func securityVerifyFromChallenge(headers map[string][]string) string {
 	return strings.Join(values, ", ")
 }
 
+// protectedTargetFromChallenge 从 401 的 Security-Server port-s 与初始 RouteURI
+// 构造受保护 REGISTER 的直连目标（P-CSCF host:port-s）。
+func protectedTargetFromChallenge(routeURI string, challengeHeaders map[string][]string) string {
+	portS := ""
+	for _, v := range trimHeaderValues(headerListValues(challengeHeaders, "Security-Server")) {
+		for _, part := range strings.Split(v, ";") {
+			part = strings.TrimSpace(part)
+			if strings.HasPrefix(strings.ToLower(part), "port-s=") {
+				portS = strings.TrimSpace(part[len("port-s="):])
+			}
+		}
+	}
+	if portS == "" {
+		return ""
+	}
+	uri := strings.TrimSpace(routeURI)
+	if uri == "" {
+		return ""
+	}
+	uri = strings.TrimPrefix(uri, "sip:")
+	host := uri
+	if i := strings.IndexAny(host, ":;"); i >= 0 {
+		host = host[:i]
+	}
+	if host == "" {
+		return ""
+	}
+	return net.JoinHostPort(host, portS)
+}
+
+// routeHeaderForChallenge 计算当前 REGISTER 的 Route 头。401 挑战后
+// Security-Server 宣告 port-s（保护端口），后续 REGISTER/请求须路由到该端口
+// （TS 33.203 逐跳保护语义）；首轮用初始 RouteURI（P-CSCF:5060）。
+func routeHeaderForChallenge(routeURI string, challengeHeaders map[string][]string) string {
+	values := trimHeaderValues(headerListValues(challengeHeaders, "Security-Server"))
+	if len(values) == 0 {
+		if strings.TrimSpace(routeURI) == "" {
+			return ""
+		}
+		return "<" + strings.TrimSpace(routeURI) + ">"
+	}
+	portS := ""
+	for _, v := range values {
+		for _, part := range strings.Split(v, ";") {
+			part = strings.TrimSpace(part)
+			if strings.HasPrefix(strings.ToLower(part), "port-s=") {
+				portS = strings.TrimSpace(part[len("port-s="):])
+			}
+		}
+	}
+	if strings.TrimSpace(routeURI) == "" {
+		return ""
+	}
+	// 1239t runSecureAuthenticatedRegister：受保护重试的 Route 集保持首轮原样
+	// （"Security agreement changes the transport ports, not the REGISTER route set"），
+	// 不把 port-s 拼进 Route（Vodafone P-CSCF 对双端口 URI 回 400 Bad header field: route）。
+	_ = portS
+	return "<" + strings.TrimSpace(routeURI) + ">"
+}
+
 func md5Hex(s string) string {
 	sum := md5.Sum([]byte(s))
 	return hex.EncodeToString(sum[:])
@@ -1450,4 +1605,158 @@ func firstTrimmed(items ...string) string {
 		}
 	}
 	return ""
+}
+
+// imsMmtelICSIRefURNEscaped 与 1239t policy.IMSMmtelICSIRef 一致（冒号已 %3A 转义）。
+const imsMmtelICSIRefURNEscaped = "urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"
+
+// stableSIPInstanceURN 在进程内保持一个稳定的 sip.instance（RFC 5626 GRUU 语义：
+// 同一 UE 的所有 REGISTER 必须带同一 instance-id）。1239t resolveStableSIPInstance 同理。
+var stableSIPInstanceURN = NewSIPInstanceURN()
+
+// buildPANIHeader 构造 P-Access-Network-Info：IEEE-802.11;country=<ISO>（VoCat
+// compose_pani_from_sip 同构——MCC→ISO 3166 alpha-2 表内取值，未命中省略 country）。
+func buildPANIHeader(profile IMSProfile) string {
+	if c := mccToISOAlpha2(profile.MCC); c != "" {
+		return "IEEE-802.11;country=" + c
+	}
+	return "IEEE-802.11"
+}
+
+// mccToISOAlpha2 最小 MCC→ISO 表（覆盖本项目在用运营商）。
+func mccToISOAlpha2(mcc string) string {
+	switch strings.TrimSpace(mcc) {
+	case "234", "235":
+		return "GB"
+	case "310", "311", "312", "313", "314", "315", "316":
+		return "US"
+	case "262":
+		return "DE"
+	case "204":
+		return "NL"
+	case "460":
+		return "CN"
+	case "454":
+		return "HK"
+	case "466":
+		return "TW"
+	case "302":
+		return "CA"
+	case "530":
+		return "NZ"
+	case "228":
+		return "CH"
+	}
+	return ""
+}
+
+// BuildGSMAIMEIInstanceURN 由 15 位 IMEI 构造 GSMA instance（TAC8-SNR6-SV1 三段）。
+func BuildGSMAIMEIInstanceURN(imei string) string {
+	imei = strings.TrimSpace(imei)
+	if len(imei) != 15 {
+		return ""
+	}
+	return "urn:gsma:imei:" + imei[:8] + "-" + imei[8:14] + "-" + imei[14:]
+}
+
+// buildRegisterContactHeader：优先 GSMA IMEI instance（v155 sip_instance_imei 模式），
+// 否则退回进程稳定 UUID instance。参数顺序对齐 1239t default(giffgaff)
+// ContactParamOrder：access_type → audio → smsip → icsi_ref → sip_instance，尾挂 ;expires。
+func buildRegisterContactHeader(profile IMSProfile, contactURI string) string {
+	instance := BuildGSMAIMEIInstanceURN(profile.IMEI)
+	if instance == "" {
+		instance = stableSIPInstanceURN
+	}
+	b := strings.Builder{}
+	b.WriteString("<")
+	b.WriteString(strings.TrimSpace(contactURI))
+	b.WriteString(">")
+	b.WriteString(";+g.3gpp.accesstype=\"IEEE-802.11\"")
+	b.WriteString(";audio")
+	b.WriteString(";+g.3gpp.smsip")
+	b.WriteString(";+g.3gpp.icsi-ref=\"" + imsMmtelICSIRefURNEscaped + "\"")
+	b.WriteString(";+sip.instance=\"<" + instance + ">\"")
+	b.WriteString(";expires=3600")
+	return b.String()
+}
+
+// buildDefaultContactHeader 对齐 1239t default(giffgaff) ContactParamOrder：
+// access_type → audio → smsip → icsi_ref → sip_instance，尾挂 ;expires=<n>。
+func buildDefaultContactHeader(contactURI string) string {
+	b := strings.Builder{}
+	b.WriteString("<")
+	b.WriteString(strings.TrimSpace(contactURI))
+	b.WriteString(">")
+	b.WriteString(";+g.3gpp.accesstype=\"IEEE-802.11\"")
+	b.WriteString(";audio")
+	b.WriteString(";+g.3gpp.smsip")
+	b.WriteString(";+g.3gpp.icsi-ref=\"" + imsMmtelICSIRefURNEscaped + "\"")
+	b.WriteString(";+sip.instance=\"<" + stableSIPInstanceURN + ">\"")
+	b.WriteString(";expires=3600")
+	return b.String()
+}
+
+// NewSIPInstanceURN 生成 SIP 实例标识（RFC 5626）：UUID v4 的 urn 表示。
+// P-CSCF 会校验 +sip.instance 参数格式——非 UUID 形态（如 "vowifi-go"）实测
+// 触发 400 Bad Request。
+func NewSIPInstanceURN() string {
+	var b [16]byte
+	if _, err := cryptorand.Read(b[:]); err != nil {
+		return "urn:uuid:00000000-0000-4000-8000-000000000000"
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("urn:uuid:%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+		b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15])
+}
+
+// GenerateSIPTag 生成 From 头的随机 tag（RFC 3261 19.3：至少 32bit 随机）。
+func GenerateSIPTag() string {
+	var b [8]byte
+	if _, err := cryptorand.Read(b[:]); err != nil {
+		return "vowifi-go"
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// BuildInitialAKAEmptyAuthorization 构造 aka_empty 占位 Authorization 头
+// （参考 imscore buildInitialAuthorization）：username=IMPI、uri=注册域、
+// nonce/response 留空、algorithm=AKAv1-MD5。
+func BuildInitialAKAEmptyAuthorization(profile IMSProfile, requestURI string) string {
+	// digest username 形状试验序（Vodafone UK S-CSCF 按 HSS 查用户）：
+	// A) 裸 IMSI → 403（0823n 实测）
+	// B) EAP root NAI（0<IMSI>@nai.epc…，1239t default）→ 403（0823p 实测）
+	// C) 标准 IMPI（<IMSI>@<home domain>，1239t imsi_home_domain 形状）→ 本版
+	username := strings.TrimSpace(profile.IMPI)
+	if username == "" {
+		username = BuildEAPRootNAI(profile)
+	}
+	if username == "" {
+		username = strings.TrimSpace(profile.IMPU)
+	}
+	realm := strings.TrimSpace(profile.Domain)
+	uri := strings.TrimSpace(requestURI)
+	if uri == "" {
+		uri = "sip:" + realm
+	}
+	// 参数顺序与 v155/1239t 的 default 分支逐字一致（uri 在前）：某些 P-CSCF
+	// 对首个 REGISTER 的 Authorization 参数顺序敏感。
+	return fmt.Sprintf("Digest uri=%q,username=%q,algorithm=AKAv1-MD5,response=\"\",realm=%q,nonce=\"\"",
+		uri, username, realm)
+}
+
+// BuildEAPRootNAI 构造 EAP 永久身份（TS 23.003 §19.3.2）：0<IMSI>@nai.epc.mnc<MNC3>.mcc<MCC>.3gppnetwork.org。
+// 与 engine/swu.eapIdentityForTunnel 同构；IMS digest 的 username 与 EAP 层身份保持一致（1239t host.go
+// imsPrivateID = eapIdentity 的默认路径）。
+func BuildEAPRootNAI(profile IMSProfile) string {
+	imsi := strings.TrimSpace(profile.IMSI)
+	mcc := strings.TrimSpace(profile.MCC)
+	mnc := strings.TrimSpace(profile.MNC)
+	if imsi == "" || mcc == "" || mnc == "" {
+		return ""
+	}
+	for len(mnc) < 3 {
+		mnc = "0" + mnc
+	}
+	return "0" + imsi + "@nai.epc.mnc" + mnc + ".mcc" + mcc + ".3gppnetwork.org"
 }

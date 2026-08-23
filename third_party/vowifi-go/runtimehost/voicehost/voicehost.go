@@ -29,10 +29,24 @@ type OutboundCallAgent interface {
 	StartOutboundCall(context.Context, OutboundCallRequest) (OutboundCallResult, error)
 }
 
-// SIPKeepaliveSender 是可选能力：空闲期周期发 dialog 外 SIP OPTIONS 维持
-// ESP 隧道业务流（IMSOutboundAgent 实现）。
+// SIPKeepaliveSender 是可选能力：空闲期周期发 keepalive 维持 ESP 隧道
+// 业务流（IMSOutboundAgent 实现）。
 type SIPKeepaliveSender interface {
 	SendKeepaliveOptions(context.Context) error
+}
+
+// SIPCRLFKeepaliveSender 是 keepalive 的 CRLF 形态（RFC 3261 §18，SIP over
+// TCP 标准 4 字节保活）。v155 反编译实证走此路径（"Keep alive CRLF
+// received"），优先于 OPTIONS 使用。
+type SIPCRLFKeepaliveSender interface {
+	SendKeepaliveCRLF(context.Context) error
+}
+
+// SIPFlowResetter 是可选能力：SA 换装（re-REGISTER Clear+Install）后旧
+// TCP 连接可能被 P-CSCF 按旧 SA 处置静默丢弃——keepalive 失败时 Reset
+// 重连自愈（SYN 不再被应答的挂死连接也一并回收）。
+type SIPFlowResetter interface {
+	ResetSIPFlow()
 }
 
 type DialogTerminator interface {

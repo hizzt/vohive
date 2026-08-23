@@ -219,7 +219,7 @@ func TestWireRegisterTransportRoundTripRegisterOverUDP(t *testing.T) {
 			if i == 0 {
 				resp = "SIP/2.0 401 Unauthorized\r\n" +
 					"WWW-Authenticate: Digest realm=\"ims.example\", nonce=\"" + base64.StdEncoding.EncodeToString(rawNonce) + "\", algorithm=AKAv1-MD5, qop=\"auth\"\r\n" +
-					"Security-Server: ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=111;spi-s=222;port-c=5062;port-s=5063\r\n" +
+					"Security-Server: ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=111;spi-s=222;port-c=5062;port-s=5063\r\n" +
 					"Content-Length: 0\r\n\r\n"
 			} else {
 				resp = "SIP/2.0 200 OK\r\n" +

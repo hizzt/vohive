@@ -40,6 +40,9 @@ type TUNTunnelManagerConfig struct {
 	Routes               []TUNRoute
 	Rules                []TUNRule
 	OnPumpError          func(PacketPumpDirection, error)
+	// Transform 传给 PacketPump 的可选逐包变换（IMS ipsec-3gpp userspace ESP）。
+	// 必须在 pump Start 前就绪且 Install 前透传。
+	Transform InnerPacketTransform
 }
 
 type TUNTunnelManager struct {
@@ -128,9 +131,10 @@ func (m *TUNTunnelManager) EstablishTunnel(ctx context.Context, cfg TunnelConfig
 		routingApplied = true
 	}
 	pump, err := NewPacketPump(PacketPumpConfig{
-		Session: packetSession,
-		Device:  device,
-		OnError: m.Config.OnPumpError,
+		Session:   packetSession,
+		Device:    device,
+		Transform: m.Config.Transform,
+		OnError:   m.Config.OnPumpError,
 	})
 	if err != nil {
 		if routingApplied {
