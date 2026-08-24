@@ -256,6 +256,9 @@ type StartRequest struct {
 	// 经隧道收发需要 LocalInnerIP（tun0 内网地址）/P-CSCF 等只在运行时
 	// 已知的参数。设置时优先于 IMSRegistrar。
 	IMSRegistrarFactory func(StartRequest, swu.TunnelResult) IMSRegistrar
+	// SIPTransport 是 IMS 注册 SIP 传输协议（"tcp"|"udp"）；IMSRegistrarFactory
+	// 读取。空值默认 tcp。部分运营商 P-CSCF 仅 UDP 应答。
+	SIPTransport string
 	// IMSIPsecTransform 挂在 tun pump 收发路径上的 IMS ipsec-3gpp ESP
 	// 变换（TS 33.203）。非 nil 时传入 TUN tunnel manager 的 PacketPump，
 	// 并可被 registrar 工厂用于在 AKA 成功后 Install 协商出的 SA。
@@ -1428,16 +1431,16 @@ func defaultTunnelManagerForStart(req StartRequest) (swu.TunnelManager, error) {
 			OnReauthenticationState: req.OnEAPReauthenticationState,
 		},
 		swu.TUNTunnelManagerConfig{
-			TUN:                 swu.TUNDeviceConfig{Name: strings.TrimSpace(req.Dataplane.TUNName)},
-			Transform:           req.IMSIPsecTransform,
-			DisableRouting:      req.Dataplane.DisableTUNRouting,
-			DefaultRoutes:       true,
-			ProtectEPDGRoutes:   true,
-			MTU:                 tunMTU,
-			Addresses:           append([]string(nil), req.Dataplane.TUNAddresses...),
+			TUN:               swu.TUNDeviceConfig{Name: strings.TrimSpace(req.Dataplane.TUNName)},
+			Transform:         req.IMSIPsecTransform,
+			DisableRouting:    req.Dataplane.DisableTUNRouting,
+			ScopedRoutes:      true,
+			ProtectEPDGRoutes: true,
+			MTU:               tunMTU,
+			Addresses:         append([]string(nil), req.Dataplane.TUNAddresses...),
 			EPDGRouteExclusions: cloneRuntimeEPDGRouteExclusions(req.Dataplane.TUNEPDGExclusions),
-			Routes:              append([]swu.TUNRoute(nil), req.Dataplane.TUNRoutes...),
-			Rules:               append([]swu.TUNRule(nil), req.Dataplane.TUNRules...),
+			Routes:            append([]swu.TUNRoute(nil), req.Dataplane.TUNRoutes...),
+			Rules:             append([]swu.TUNRule(nil), req.Dataplane.TUNRules...),
 		},
 	), nil
 }

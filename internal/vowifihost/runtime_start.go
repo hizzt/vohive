@@ -54,6 +54,8 @@ type RuntimeStartRequest struct {
 	DeliveryStore messaging.DeliveryStore
 	Dispatch      eventhost.Dispatcher
 	BeforeStart   func(context.Context, runtimehost.SessionConfig) error
+	// SIPTransport 透传到 IMS registrar（tcp|udp；空值默认 tcp）。
+	SIPTransport string
 }
 
 type RuntimeStartResult struct {
@@ -89,14 +91,20 @@ func buildVoWiFiIMSRegistrar(req runtimehost.StartRequest, tunnel swu.TunnelResu
 	// 随机 ephemeral 端口（registerAttemptLocalPort→randomEphemeralSIPPort）。
 	portC := 40000 + rand.Intn(5000)
 	portS := 40000 + rand.Intn(5000)
+	// SIP 传输协议：tcp 默认（Vodafone UK 实测）；udp 供仅 UDP 应答的
+	// 运营商 P-CSCF。TS 33.203 port-c/port-s 受保护语义两者相同。
+	sipNetwork := strings.ToLower(strings.TrimSpace(req.SIPTransport))
+	if sipNetwork != "udp" {
+		sipNetwork = "tcp"
+	}
 	return runtimehost.WireIMSRegistrar{
-		Network: "tcp",
-		SecurityPortC: portC,
-		SecurityPortS: portS,
-		LocalAddr:     net.JoinHostPort(innerIP, strconv.Itoa(portC)),
-		ServerAddr:    net.JoinHostPort(pcscf, "5060"),
-		ContactHost:   innerIP,
-		ContactPort:   portC,
+		Network:        sipNetwork,
+		SecurityPortC:  portC,
+		SecurityPortS:  portS,
+		LocalAddr:      net.JoinHostPort(innerIP, strconv.Itoa(portC)),
+		ServerAddr:     net.JoinHostPort(pcscf, "5060"),
+		ContactHost:    innerIP,
+		ContactPort:    portC,
 		// TS 33.203 ipsec-3gpp 二层 ESP：registrar 在 AKA 成功后 Install，
 		// tun pump 对 port-c↔port-s 的 SIP 做 ESP 封装（明文 CSeq3 实测 401）。
 		IPsecTransform: req.IMSIPsecTransform,
@@ -160,6 +168,7 @@ func (m *Manager) StartRuntime(ctx context.Context, req RuntimeStartRequest) (Ru
 		// ipsec-3gpp transform 同一实例贯穿 tun pump（数据面）与 registrar
 		// （控制面 Install）——必须在 tunnel 建立前创建并传入两者。
 		IMSRegistrarFactory: buildVoWiFiIMSRegistrar,
+		SIPTransport:        strings.ToLower(strings.TrimSpace(m.sipTransport)),
 		IMSIPsecTransform:   imsipsec.NewTransform(),
 		BeforeStart:         req.BeforeStart,
 		ShouldRun: func() bool {

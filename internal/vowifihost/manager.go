@@ -2,6 +2,7 @@ package vowifihost
 
 import (
 	"context"
+	"strings"
 
 	"github.com/iniwex5/vowifi-go/runtimehost"
 	"github.com/iniwex5/vowifi-go/runtimehost/eventhost"
@@ -19,6 +20,9 @@ type Manager struct {
 	voiceGateway  *voicehost.Gateway
 	deliveryStore messaging.DeliveryStore
 	dispatcher    eventhost.Dispatcher
+	// sipTransport 是 IMS 注册 SIP 传输（tcp|udp），来自 config vowifi.sip_transport；
+	// 空值默认 tcp。部分运营商 P-CSCF 仅 UDP 应答。
+	sipTransport string
 }
 
 func NewManager() *Manager {
@@ -79,6 +83,19 @@ func (m *Manager) ConfigureRuntimeDependencies(vg *voicehost.Gateway, ds messagi
 	m.voiceGateway = vg
 	m.deliveryStore = ds
 	m.dispatcher = ed
+}
+
+// SetSIPTransport 设置 IMS 注册 SIP 传输协议（tcp|udp，空/非法值回退 tcp）。
+func (m *Manager) SetSIPTransport(transport string) {
+	if m == nil {
+		return
+	}
+	switch strings.ToLower(strings.TrimSpace(transport)) {
+	case "udp":
+		m.sipTransport = "udp"
+	default:
+		m.sipTransport = "tcp"
+	}
 }
 
 func (m *Manager) ClearStartupStateAndBroadcast(deviceID string) {

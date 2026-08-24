@@ -3,7 +3,9 @@ package esp
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/des"
 	"crypto/hmac"
+	"crypto/md5"
 	"crypto/rand"
 	"crypto/sha1"
 	"crypto/sha256"
@@ -31,6 +33,21 @@ type IntegrityAlgorithm uint16
 const (
 	IntegrityHMACSHA1_96      IntegrityAlgorithm = IntegrityAlgorithm(ikev2.INTEG_HMAC_SHA1_96)
 	IntegrityHMACSHA2_256_128 IntegrityAlgorithm = IntegrityAlgorithm(ikev2.INTEG_HMAC_SHA2_256_128)
+	// IntegrityHMACMD5_96：IKEv2 没有此 ID（隧道 SA 用不到），按 RFC 2406
+	// HMAC-MD5-96 的 IANA 值 1。TS 33.203 Security-Server 协商 hmac-md5-96
+	// 时用于 IMS ipsec-3gpp 二层 ESP（IK[:16] 做密钥），ICV 截 12 字节。
+	IntegrityHMACMD5_96 IntegrityAlgorithm = 1
+)
+
+// EncryptionAlgorithm 区分 ESP 加密器。CipherAES128CBC 是隧道 CHILD_SA
+// 现役路径；Cipher3DESCBC/CipherNULL 是 IMS ipsec-3gpp 二层 ESP 的
+// TS 33.203 协商组合（des-ede3-cbc / null），1239t keys.go 同源实现。
+type EncryptionAlgorithm int
+
+const (
+	CipherAES128CBC EncryptionAlgorithm = iota
+	Cipher3DESCBC
+	CipherNULL
 )
 
 type SA struct {
@@ -38,6 +55,7 @@ type SA struct {
 	EncryptionKey    []byte
 	IntegrityKey     []byte
 	Integrity        IntegrityAlgorithm
+	Cipher           EncryptionAlgorithm
 	ICVLength        int
 	BlockSize        int
 	Sequence         uint32
@@ -94,17 +112,28 @@ func NewSA(sa SA) (*SA, error) {
 	if sa.SPI == 0 {
 		return nil, fmt.Errorf("%w: spi is zero", ErrInvalidSA)
 	}
-	if len(sa.EncryptionKey) != 16 && len(sa.EncryptionKey) != 24 && len(sa.EncryptionKey) != 32 {
-		return nil, fmt.Errorf("%w: AES key length %d", ErrInvalidSA, len(sa.EncryptionKey))
+	blockSize := aes.BlockSize
+	switch sa.Cipher {
+	case CipherAES128CBC:
+		if len(sa.EncryptionKey) != 16 && len(sa.EncryptionKey) != 24 && len(sa.EncryptionKey) != 32 {
+			return nil, fmt.Errorf("%w: AES key length %d", ErrInvalidSA, len(sa.EncryptionKey))
+		}
+	case Cipher3DESCBC:
+		if len(sa.EncryptionKey) != 24 {
+			return nil, fmt.Errorf("%w: 3DES key length %d", ErrInvalidSA, len(sa.EncryptionKey))
+		}
+		blockSize = des.BlockSize
+	case CipherNULL:
+		// RFC 2410：无加密无 IV，仍保留常规 padding 字节流。
+		sa.EncryptionKey = nil
+		blockSize = 1
 	}
+	if sa.BlockSize != 0 && sa.BlockSize != blockSize {
+		return nil, fmt.Errorf("%w: block size %d", ErrInvalidSA, sa.BlockSize)
+	}
+	sa.BlockSize = blockSize
 	if len(sa.IntegrityKey) == 0 {
 		return nil, fmt.Errorf("%w: integrity key is empty", ErrInvalidSA)
-	}
-	if sa.BlockSize == 0 {
-		sa.BlockSize = aes.BlockSize
-	}
-	if sa.BlockSize != aes.BlockSize {
-		return nil, fmt.Errorf("%w: block size %d", ErrInvalidSA, sa.BlockSize)
 	}
 	if sa.ICVLength == 0 {
 		sa.ICVLength = integrityICVLength(sa.Integrity)
@@ -130,7 +159,7 @@ func (s *SA) Seal(nextHeader uint8, payload []byte, opts SealOptions) ([]byte, e
 		s.Sequence = seq
 	}
 	iv := append([]byte(nil), opts.IV...)
-	if len(iv) == 0 {
+	if len(iv) == 0 && s.Cipher != CipherNULL {
 		random := opts.Random
 		if random == nil {
 			random = rand.Reader
@@ -140,11 +169,11 @@ func (s *SA) Seal(nextHeader uint8, payload []byte, opts SealOptions) ([]byte, e
 			return nil, err
 		}
 	}
-	if len(iv) != s.BlockSize {
+	if s.Cipher != CipherNULL && len(iv) != s.BlockSize {
 		return nil, fmt.Errorf("%w: iv length %d", ErrInvalidPacket, len(iv))
 	}
 	plain := espPlaintext(payload, nextHeader, s.BlockSize)
-	ciphertext, err := aesCBCEncrypt(s.EncryptionKey, iv, plain)
+	ciphertext, err := s.encrypt(iv, plain)
 	if err != nil {
 		return nil, err
 	}
@@ -189,12 +218,21 @@ func (s *SA) Open(packet []byte) (OpenResult, error) {
 		return OpenResult{}, err
 	}
 	body := packet[8:bodyEnd]
+	if s.Cipher == CipherNULL {
+		// RFC 2410：无 IV，body 即（伪）密文。
+		payload, nextHeader, err := parseESPPlaintext(body)
+		if err != nil {
+			return OpenResult{}, err
+		}
+		s.acceptSequence(seq)
+		return OpenResult{SPI: spi, Sequence: seq, NextHeader: nextHeader, Payload: payload}, nil
+	}
 	if len(body) < s.BlockSize || (len(body)-s.BlockSize)%s.BlockSize != 0 {
 		return OpenResult{}, fmt.Errorf("%w: invalid encrypted body length", ErrInvalidPacket)
 	}
 	iv := body[:s.BlockSize]
 	ciphertext := body[s.BlockSize:]
-	plain, err := aesCBCDecrypt(s.EncryptionKey, iv, ciphertext)
+	plain, err := s.decrypt(iv, ciphertext)
 	if err != nil {
 		return OpenResult{}, err
 	}
@@ -213,6 +251,8 @@ func (s *SA) integrity(data []byte) ([]byte, error) {
 		mac = hmac.New(sha1.New, s.IntegrityKey)
 	case IntegrityHMACSHA2_256_128:
 		mac = hmac.New(sha256.New, s.IntegrityKey)
+	case IntegrityHMACMD5_96:
+		mac = hmac.New(md5.New, s.IntegrityKey)
 	default:
 		return nil, fmt.Errorf("%w: unsupported integrity %d", ErrInvalidSA, s.Integrity)
 	}
@@ -334,9 +374,65 @@ func integrityICVLength(integ IntegrityAlgorithm) int {
 		return 12
 	case IntegrityHMACSHA2_256_128:
 		return 16
+	case IntegrityHMACMD5_96:
+		return 12
 	default:
 		return 0
 	}
+}
+
+// encrypt 按 SA 的加密器封装 ESP 明文（padding 已含）。
+func (s *SA) encrypt(iv, plain []byte) ([]byte, error) {
+	switch s.Cipher {
+	case CipherAES128CBC:
+		return aesCBCEncrypt(s.EncryptionKey, iv, plain)
+	case Cipher3DESCBC:
+		return tripleDesCBCEncrypt(s.EncryptionKey, iv, plain)
+	case CipherNULL:
+		// RFC 2410：明文原样即"密文"，无 IV。
+		return append([]byte(nil), plain...), nil
+	default:
+		return nil, fmt.Errorf("%w: unsupported cipher %d", ErrInvalidSA, s.Cipher)
+	}
+}
+
+func (s *SA) decrypt(iv, ciphertext []byte) ([]byte, error) {
+	switch s.Cipher {
+	case CipherAES128CBC:
+		return aesCBCDecrypt(s.EncryptionKey, iv, ciphertext)
+	case Cipher3DESCBC:
+		return tripleDesCBCDecrypt(s.EncryptionKey, iv, ciphertext)
+	case CipherNULL:
+		return append([]byte(nil), ciphertext...), nil
+	default:
+		return nil, fmt.Errorf("%w: unsupported cipher %d", ErrInvalidSA, s.Cipher)
+	}
+}
+
+func tripleDesCBCEncrypt(key, iv, plain []byte) ([]byte, error) {
+	block, err := des.NewTripleDESCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	if len(iv) != block.BlockSize() || len(plain)%block.BlockSize() != 0 {
+		return nil, fmt.Errorf("%w: invalid 3DES-CBC input", ErrInvalidPacket)
+	}
+	out := make([]byte, len(plain))
+	cipher.NewCBCEncrypter(block, iv).CryptBlocks(out, plain)
+	return out, nil
+}
+
+func tripleDesCBCDecrypt(key, iv, ciphertext []byte) ([]byte, error) {
+	block, err := des.NewTripleDESCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	if len(iv) != block.BlockSize() || len(ciphertext)%block.BlockSize() != 0 {
+		return nil, fmt.Errorf("%w: invalid 3DES-CBC input", ErrInvalidPacket)
+	}
+	out := make([]byte, len(ciphertext))
+	cipher.NewCBCDecrypter(block, iv).CryptBlocks(out, ciphertext)
+	return out, nil
 }
 
 func spiFromBytes(spi []byte) (uint32, error) {

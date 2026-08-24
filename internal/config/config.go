@@ -93,6 +93,11 @@ type VoWiFiConfig struct {
 	DeviceID string `mapstructure:"device_id"` // 留空则取第一个
 	Mode     string `mapstructure:"mode"`      // vowifi|volte(当前会回退为 vowifi)，默认 vowifi
 
+	// SIPTransport 是 IMS 注册的 SIP 传输协议：tcp（默认，Vodafone UK 实测）
+	// 或 udp（部分运营商 P-CSCF 仅 UDP 应答；TS 33.203 port-c/port-s 受保护
+	// 语义两者相同，二层 ESP 选择器同时匹配 TCP/UDP）。
+	SIPTransport string `mapstructure:"sip_transport"`
+
 	VoiceGateway VoWiFiVoiceGatewayConfig `mapstructure:"voice_gateway"`
 }
 

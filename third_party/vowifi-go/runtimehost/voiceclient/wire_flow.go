@@ -338,19 +338,21 @@ func (f *WireSIPFlow) ensureConnLocked(ctx context.Context, msg SIPRequestMessag
 		timeout = 5 * time.Second
 	}
 	wantTarget := strings.TrimSpace(f.ServerAddr)
-	if override := strings.TrimSpace(f.OverrideTarget); override != "" && strings.HasPrefix(network, "tcp") {
+	if override := strings.TrimSpace(f.OverrideTarget); override != "" {
 		wantTarget = override
 	}
 	if f.conn != nil && f.network == network && (wantTarget == "" || f.target == wantTarget) {
 		return f.conn, network, timeout, nil
 	}
-	if override := strings.TrimSpace(f.OverrideTarget); override != "" && strings.HasPrefix(network, "tcp") {
-		// 受保护 REGISTER（TS 33.203）：P-CSCF port-s 上建立的长连接跨
-		// re-REGISTER 复用（SA 换装不影响 TCP 连接本身，seq 由 SA 各自维护）
+	if override := strings.TrimSpace(f.OverrideTarget); override != "" {
+		// 受保护 REGISTER（TS 33.203）：P-CSCF port-s 上的连接跨
+		// re-REGISTER 复用（SA 换装不影响连接本身，seq 由 SA 各自维护）
 		// ——v155 行为对齐：连接活着就不重建，避免运营商侧可见的周期性
 		// RST+重拨指纹。仅当无连接/目标变化时拨新连接：从 port-c 源端口
-		// 拨（ESP 选择器按 Security-Client 宣告的 port-c 匹配）；关旧连接
-		// 置 SO_LINGER=0 走 RST，port-c 立即可重绑。
+		// 拨（ESP 选择器按 Security-Client 宣告的 port-c 匹配）；TCP 关旧
+		// 连接置 SO_LINGER=0 走 RST，port-c 立即可重绑（UDP 无连接语义，
+		// 重拨即重绑同端口）。UDP 模式下部分运营商 P-CSCF 只对 5060 UDP
+		// 应答，走同一受保护路径。
 		if f.conn != nil && f.target == override {
 			return f.conn, network, timeout, nil
 		}
@@ -378,7 +380,11 @@ func (f *WireSIPFlow) ensureConnLocked(ctx context.Context, msg SIPRequestMessag
 		f.conn = conn
 		f.network = network
 		f.target = override
-		f.reader = bufio.NewReader(conn)
+		if strings.HasPrefix(network, "tcp") {
+			f.reader = bufio.NewReader(conn)
+		} else {
+			f.reader = nil
+		}
 		return conn, network, timeout, nil
 	}
 	targets, err := f.ensureTargetsLocked(ctx, network, msg.URI)

@@ -180,6 +180,58 @@ func TestTUNTunnelManagerAddsDefaultRouteAndEPDGProtection(t *testing.T) {
 	}
 }
 
+func TestTUNTunnelManagerScopedRoutesOnlyIMSDestinations(t *testing.T) {
+	baseSession := newTUNManagerPacketSession(TunnelResult{
+		Ready:            true,
+		EPDGAddress:      "198.51.100.8",
+		LocalInnerIP:     "10.196.62.70",
+		RemoteInnerIP:    "10.196.62.69",
+		DNSServers:       []string{"10.196.62.53", "10.196.62.69"},
+		PSCFAddress:      "10.128.120.66",
+		IKEEstablished:   true,
+		IPsecEstablished: true,
+	})
+	device := newTUNManagerDevice("vohive0")
+	routing := &tunManagerRouting{}
+	manager := NewTUNTunnelManager(TUNTunnelManagerConfig{
+		Base:              &tunManagerBase{session: baseSession},
+		RoutingManager:    routing,
+		ScopedRoutes:      true,
+		ProtectEPDGRoutes: true,
+		EPDGRouteResolver: func(ctx context.Context, host string) ([]net.IP, error) {
+			return []net.IP{net.ParseIP("198.51.100.8")}, nil
+		},
+		DeviceFactory: func(ctx context.Context, cfg TunnelConfig, result TunnelResult) (InnerPacketDevice, string, error) {
+			return device, "vohive0", nil
+		},
+	})
+	session, err := manager.EstablishTunnel(context.Background(), TunnelConfig{
+		DeviceID:       "dev-1",
+		Mode:           DataplaneModeUserspace,
+		EPDGAddress:    "198.51.100.8",
+		LocalInterface: routeInterfaceForTest(t),
+		OuterLocalIP:   "192.0.2.10",
+		IMSI:           "310280233641503",
+	})
+	if err != nil {
+		t.Fatalf("EstablishTunnel() error = %v", err)
+	}
+	defer session.Close(context.Background())
+	if len(routing.applies) != 1 {
+		t.Fatalf("routing applies=%d, want 1", len(routing.applies))
+	}
+	applied := routing.applies[0]
+	want := []string{"10.128.120.66/32", "10.196.62.69/32", "10.196.62.53/32"}
+	if len(applied.Routes) != len(want) {
+		t.Fatalf("routes=%+v, want %v", applied.Routes, want)
+	}
+	for i, route := range applied.Routes {
+		if route.Destination != want[i] {
+			t.Fatalf("route[%d]=%q, want %q (no default route may be present)", i, route.Destination, want[i])
+		}
+	}
+}
+
 func TestTUNTunnelManagerProtectsEPDGRoutesForPolicyTables(t *testing.T) {
 	baseSession := newTUNManagerPacketSession(TunnelResult{
 		Ready:            true,

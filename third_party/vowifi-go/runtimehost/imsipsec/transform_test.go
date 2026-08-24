@@ -189,11 +189,21 @@ func TestTransformPassthroughUnmatched(t *testing.T) {
 	if out, err := transform.TransformOutbound(far); err != nil || string(out) != string(far) {
 		t.Fatalf("traffic to other IP must pass through, err=%v", err)
 	}
-	// UDP（如 DNS）透传。
-	udp := buildTCPv4Packet(t, net.ParseIP("192.168.156.2"), net.ParseIP("10.128.120.67"), 50601, 50600, 50)
-	udp[9] = 17
+	// UDP 非选择器端口（如 DNS）透传。
+	udp := buildTCPv4Packet(t, net.ParseIP("192.168.156.2"), net.ParseIP("10.128.120.67"), 40000, 53, 50)
+	udp[9] = ipProtoUDP
 	if out, err := transform.TransformOutbound(udp); err != nil || string(out) != string(udp) {
-		t.Fatalf("UDP must pass through, err=%v", err)
+		t.Fatalf("UDP outside selector ports must pass through, err=%v", err)
+	}
+	// UDP 命中选择器端口（UDP SIP 模式）也封装为 ESP。
+	udpSIP := buildTCPv4Packet(t, net.ParseIP("192.168.156.2"), net.ParseIP("10.128.120.67"), 50601, 50600, 50)
+	udpSIP[9] = ipProtoUDP
+	enc, err := transform.TransformOutbound(udpSIP)
+	if err != nil {
+		t.Fatalf("UDP in selector ports must be encapsulated, err=%v", err)
+	}
+	if enc[9] != ipProtoESP {
+		t.Fatalf("UDP SIP next header=%d want ESP", enc[9])
 	}
 	// 非 ESP 入向透传。
 	plain := buildTCPv4Packet(t, net.ParseIP("10.128.120.67"), net.ParseIP("192.168.156.2"), 50600, 50601, 40)
@@ -259,3 +269,169 @@ type errString string
 func (e errString) Error() string { return string(e) }
 
 var _ = strings.TrimSpace
+
+// testPolicyWithAlgs 按指定算法组合构造策略（算法矩阵测试用）。
+func testPolicyWithAlgs(t *testing.T, alg, ealg string) Policy {
+	t.Helper()
+	ck := make([]byte, 16)
+	ik := make([]byte, 16)
+	for i := range ck {
+		ck[i] = byte(i + 1)
+		ik[i] = byte(i + 0x41)
+	}
+	client := Mechanism{
+		Alg: alg, EAlg: ealg,
+		SPIc: 0x11223344, SPIs: 0x55667788,
+		PortC: 50601, PortS: 50600,
+	}
+	server := Mechanism{
+		Alg: alg, EAlg: ealg,
+		SPIc: 0x99aabbcc, SPIs: 0xddeeff00,
+		PortC: 50601, PortS: 50600,
+	}
+	policy, err := NewPolicy(PolicyInput{
+		LocalIP:    net.ParseIP("192.168.156.2"),
+		RemoteIP:   net.ParseIP("10.128.120.67"),
+		ClientMech: client,
+		ServerMech: server,
+		CK:         ck,
+		IK:         ik,
+	})
+	if err != nil {
+		t.Fatalf("NewPolicy: %v", err)
+	}
+	return policy
+}
+
+// TestTransformRoundTripAlgorithmMatrix 换运营商硬前提：TS 33.203 全部
+// 协商组合的二层 ESP 往返（出向封装 + 对端视角入向解封）。
+func TestTransformRoundTripAlgorithmMatrix(t *testing.T) {
+	cases := []struct {
+		name string
+		alg  string
+		ealg string
+	}{
+		{"sha1-96+aes-cbc", "hmac-sha-1-96", "aes-cbc"},   // Vodafone UK 现役
+		{"md5-96+aes-cbc", "hmac-md5-96", "aes-cbc"},     //
+		{"sha1-96+3des", "hmac-sha-1-96", "des-ede3-cbc"}, //
+		{"md5-96+3des", "hmac-md5-96", "des-ede3-cbc"},    //
+		{"sha1-96+null", "hmac-sha-1-96", "null"},         //
+		{"md5-96+null", "hmac-md5-96", "null"},            //
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			policy := testPolicyWithAlgs(t, tc.alg, tc.ealg)
+			transform := NewTransform()
+			if err := transform.Install(policy); err != nil {
+				t.Fatalf("Install: %v", err)
+			}
+			plain := buildTCPv4Packet(t, net.ParseIP("192.168.156.2"), net.ParseIP("10.128.120.67"), 50601, 50600, 100)
+			out, err := transform.TransformOutbound(plain)
+			if err != nil {
+				t.Fatalf("TransformOutbound: %v", err)
+			}
+			if out[9] != ipProtoESP {
+				t.Fatalf("next header=%d want ESP", out[9])
+			}
+			if binary.BigEndian.Uint32(out[20:24]) != policy.FlowC.OutboundSPI {
+				t.Fatalf("outbound SPI=%08x want %08x", binary.BigEndian.Uint32(out[20:24]), policy.FlowC.OutboundSPI)
+			}
+			// 对端视角：P-CSCF 用 UE 宣告的 spi-c + 同套密钥封装回程。
+			peerEnc, peerAuth, err := DeriveSecureChannelKeys(policy.FlowC)
+			if err != nil {
+				t.Fatalf("peer derive: %v", err)
+			}
+			cipher, blockSize := espCipher(tc.ealg)
+			peerSA, err := esp.NewSA(esp.SA{
+				SPI:           policy.FlowC.InboundSPI,
+				EncryptionKey: peerEnc,
+				IntegrityKey:  peerAuth,
+				Integrity:     espIntegrity(tc.alg),
+				Cipher:        cipher,
+				ICVLength:     12,
+				BlockSize:     blockSize,
+			})
+			if err != nil {
+				t.Fatalf("peer SA: %v", err)
+			}
+			peerESP, err := peerSA.Seal(ipProtoTCP, plain[20:], esp.SealOptions{})
+			if err != nil {
+				t.Fatalf("peer seal: %v", err)
+			}
+			peerHdr := swapAddresses(plain[:20])
+			peerHdr[9] = ipProtoESP
+			inbound := append(peerHdr, peerESP...)
+			binary.BigEndian.PutUint16(inbound[2:4], uint16(len(inbound)))
+			binary.BigEndian.PutUint16(inbound[10:12], 0)
+			binary.BigEndian.PutUint16(inbound[10:12], ipv4HeaderChecksum(inbound[:20]))
+			dec, err := transform.TransformInbound(inbound)
+			if err != nil {
+				t.Fatalf("TransformInbound: %v", err)
+			}
+			if dec[9] != ipProtoTCP || len(dec) != len(plain) || string(dec[20:]) != string(plain[20:]) {
+				t.Fatalf("round trip mismatch: nextHeader=%d len=%d", dec[9], len(dec))
+			}
+		})
+	}
+}
+
+// TestTransformRoundTripFlowS 验证 FlowS 方向（P-CSCF 主动发起的请求通道）：
+// UE port-s → P-CSCF port-c 出向封装（SPI=P-CSCF spi-c），P-CSCF → UE port-s
+// 回程解封（SPI=UE spi-s）。来话 INVITE 的通道前提（业务处理在 V4 语音阶段）。
+func TestTransformRoundTripFlowS(t *testing.T) {
+	policy := testPolicy(t)
+	transform := NewTransform()
+	if err := transform.Install(policy); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	// UE port-s → P-CSCF port-c。
+	plain := buildTCPv4Packet(t, net.ParseIP("192.168.156.2"), net.ParseIP("10.128.120.67"), 50600, 50601, 80)
+	out, err := transform.TransformOutbound(plain)
+	if err != nil {
+		t.Fatalf("TransformOutbound: %v", err)
+	}
+	if out[9] != ipProtoESP {
+		t.Fatalf("next header=%d want ESP", out[9])
+	}
+	if binary.BigEndian.Uint32(out[20:24]) != policy.FlowS.OutboundSPI {
+		t.Fatalf("outbound SPI=%08x want server spi-c %08x", binary.BigEndian.Uint32(out[20:24]), policy.FlowS.OutboundSPI)
+	}
+	if err := verifyIPv4Checksum(out); err != nil {
+		t.Fatalf("outbound checksum: %v", err)
+	}
+
+	// 对端视角：P-CSCF 用 UE 宣告的 spi-s + 同套密钥封装 port-c → port-s 回程。
+	peerEnc, peerAuth, err := DeriveSecureChannelKeys(policy.FlowS)
+	if err != nil {
+		t.Fatalf("peer derive: %v", err)
+	}
+	peerSA, err := esp.NewSA(esp.SA{
+		SPI:           policy.FlowS.InboundSPI, // UE 宣告的 spi-s
+		EncryptionKey: peerEnc,
+		IntegrityKey:  peerAuth,
+		Integrity:     esp.IntegrityHMACSHA1_96,
+		Cipher:        esp.CipherAES128CBC,
+		ICVLength:     12,
+		BlockSize:     16,
+	})
+	if err != nil {
+		t.Fatalf("peer SA: %v", err)
+	}
+	peerESP, err := peerSA.Seal(ipProtoTCP, plain[20:], esp.SealOptions{})
+	if err != nil {
+		t.Fatalf("peer seal: %v", err)
+	}
+	peerHdr := swapAddresses(plain[:20])
+	peerHdr[9] = ipProtoESP
+	inbound := append(peerHdr, peerESP...)
+	binary.BigEndian.PutUint16(inbound[2:4], uint16(len(inbound)))
+	binary.BigEndian.PutUint16(inbound[10:12], 0)
+	binary.BigEndian.PutUint16(inbound[10:12], ipv4HeaderChecksum(inbound[:20]))
+	dec, err := transform.TransformInbound(inbound)
+	if err != nil {
+		t.Fatalf("TransformInbound: %v", err)
+	}
+	if dec[9] != ipProtoTCP || len(dec) != len(plain) || string(dec[20:]) != string(plain[20:]) {
+		t.Fatalf("round trip mismatch: nextHeader=%d len=%d", dec[9], len(dec))
+	}
+}

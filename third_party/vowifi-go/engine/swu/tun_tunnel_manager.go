@@ -32,6 +32,11 @@ type TUNTunnelManagerConfig struct {
 	RoutingConfigFactory TUNRoutingConfigFactory
 	DisableRouting       bool
 	DefaultRoutes        bool
+	// ScopedRoutes 不抢默认路由：只为隧道协商下发的内网目的地址
+	// （P-CSCF/对端网关/DNS）装 /32 主机路由。整机默认路由留在原
+	// 出口（wlan0）——VoWiFi 信令网关形态（设备实测 2026-08-23：
+	// DefaultRoutes 抢 default 后飞书等国内服务经伦敦出口全部超时）。
+	ScopedRoutes bool
 	ProtectEPDGRoutes    bool
 	EPDGRouteResolver    EPDGRouteResolver
 	MTU                  int
@@ -207,6 +212,14 @@ func (m *TUNTunnelManager) routingConfig(ctx context.Context, cfg TunnelConfig, 
 	if m.Config.DefaultRoutes && len(routes) == 0 {
 		routes = append(routes, TUNRoute{Destination: "default"})
 	}
+	if m.Config.ScopedRoutes {
+		// 只装 IMS 目的 /32：SIP socket 本就显式绑 tun0 内网 IP，
+		// ESP 保活探测目标 = RemoteInnerIP/DNS——全部被这些主机路由
+		// 覆盖；ePDG 外层流量另由 EPDGRouteExclusions 走 wlan0。
+		for _, dst := range tunnelScopedRouteDestinations(result) {
+			routes = append(routes, TUNRoute{Destination: dst})
+		}
+	}
 	exclusions := cloneEPDGRouteExclusions(m.Config.EPDGRouteExclusions)
 	if m.Config.ProtectEPDGRoutes {
 		defaultExclusions, err := m.defaultEPDGRouteExclusions(ctx, cfg, result, routes)
@@ -311,6 +324,40 @@ func routingTablesForRoutes(routes []TUNRoute) []string {
 
 func normalizeRouteDestinationForRoutingTables(destination string) string {
 	return strings.ToLower(strings.TrimSpace(destination))
+}
+
+// tunnelScopedRouteDestinations 从隧道协商结果提取需要路由进 tun0 的
+// 内网目的地址（/32 主机路由）：P-CSCF（SIP 信令）、RemoteInnerIP（ESP
+// 保活探测的对端网关）、下发的 DNS（探测目标/注册域名解析）。
+// 空/重复/非 IP 值跳过；LocalInnerIP 是本机地址不需要路由。
+func tunnelScopedRouteDestinations(result TunnelResult) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(value string) {
+		host := strings.TrimSpace(value)
+		if host == "" {
+			return
+		}
+		// PSCFAddress 可能带端口（host:port 形式），取主机部分。
+		if _, _, err := net.SplitHostPort(host); err == nil {
+			if h, _, splitErr := net.SplitHostPort(host); splitErr == nil {
+				host = h
+			}
+		}
+		if ip := net.ParseIP(host); ip == nil || ip.To4() == nil {
+			return
+		}
+		if !seen[host] {
+			seen[host] = true
+			out = append(out, host+"/32")
+		}
+	}
+	add(result.PSCFAddress)
+	add(result.RemoteInnerIP)
+	for _, dns := range result.DNSServers {
+		add(dns)
+	}
+	return out
 }
 
 func (s *TUNPacketTunnelSession) Result() TunnelResult {

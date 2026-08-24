@@ -144,3 +144,107 @@ func TestNewSAFromChildDirections(t *testing.T) {
 		t.Fatalf("keys outbound=%x inbound=%x", outbound.EncryptionKey, inbound.EncryptionKey)
 	}
 }
+
+// TS 33.203 ipsec-3gpp 二层 ESP 算法矩阵：hmac-md5-96 / des-ede3-cbc /
+// null 加密（RFC 2410）——换运营商协商组合的硬前提（hmac-sha-1-96 +
+// aes-cbc 已由现役隧道 SA 覆盖）。
+func TestSealOpenRoundTripAlgorithmMatrix(t *testing.T) {
+	payload := []byte{0x45, 0x00, 0x00, 0x14, 0xaa, 0xbb, 0xcc, 0xdd}
+	cases := []struct {
+		name    string
+		cipher  EncryptionAlgorithm
+		encKey  []byte
+		integ   IntegrityAlgorithm
+		integOK []byte
+		ivLen   int
+	}{
+		{
+			name:    "md5-96+aes-cbc",
+			cipher:  CipherAES128CBC,
+			encKey:  bytes.Repeat([]byte{0x33}, 16),
+			integ:   IntegrityHMACMD5_96,
+			integOK: bytes.Repeat([]byte{0x44}, 16),
+			ivLen:   16,
+		},
+		{
+			name:    "sha1-96+3des-cbc",
+			cipher:  Cipher3DESCBC,
+			encKey:  bytes.Repeat([]byte{0x55}, 24),
+			integ:   IntegrityHMACSHA1_96,
+			integOK: bytes.Repeat([]byte{0x66}, 20),
+			ivLen:   8,
+		},
+		{
+			name:    "md5-96+null",
+			cipher:  CipherNULL,
+			integ:   IntegrityHMACMD5_96,
+			integOK: bytes.Repeat([]byte{0x77}, 16),
+			ivLen:   0,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sa, err := NewSA(SA{
+				SPI:           0x11223344,
+				EncryptionKey: tc.encKey,
+				IntegrityKey:  tc.integOK,
+				Integrity:     tc.integ,
+				Cipher:        tc.cipher,
+			})
+			if err != nil {
+				t.Fatalf("NewSA() error = %v", err)
+			}
+			packet, err := sa.Seal(NextHeaderIPv4, payload, SealOptions{Sequence: 3})
+			if err != nil {
+				t.Fatalf("Seal() error = %v", err)
+			}
+			openSA, err := NewSA(SA{
+				SPI:           0x11223344,
+				EncryptionKey: tc.encKey,
+				IntegrityKey:  tc.integOK,
+				Integrity:     tc.integ,
+				Cipher:        tc.cipher,
+			})
+			if err != nil {
+				t.Fatalf("NewSA(open) error = %v", err)
+			}
+			out, err := openSA.Open(packet)
+			if err != nil {
+				t.Fatalf("Open() error = %v", err)
+			}
+			if out.NextHeader != NextHeaderIPv4 || !bytes.Equal(out.Payload, payload) {
+				t.Fatalf("open=%+v payload=%x", out, out.Payload)
+			}
+			// ICV 长度：md5-96/sha1-96 均为 12。
+			if len(packet)-len(payload) < 8+2+12 {
+				t.Fatalf("packet too short for ESP header+pad+ICV: %d", len(packet))
+			}
+			if tc.cipher == CipherNULL {
+				// RFC 2410：无 IV，IV 区域零长度。
+				if len(packet) != 8+len(payload)+2+12 {
+					t.Fatalf("null cipher packet len=%d, want %d", len(packet), 8+len(payload)+2+12)
+				}
+			}
+		})
+	}
+}
+
+func TestNewSARejectsBadCipherKeyLengths(t *testing.T) {
+	if _, err := NewSA(SA{
+		SPI:           1,
+		EncryptionKey: bytes.Repeat([]byte{0x01}, 16),
+		IntegrityKey:  bytes.Repeat([]byte{0x02}, 20),
+		Integrity:     IntegrityHMACSHA1_96,
+		Cipher:        Cipher3DESCBC,
+	}); err == nil {
+		t.Fatal("3DES with 16-byte key should be rejected")
+	}
+	if _, err := NewSA(SA{
+		SPI:           1,
+		IntegrityKey:  bytes.Repeat([]byte{0x02}, 20),
+		Integrity:     IntegrityHMACSHA1_96,
+		Cipher:        CipherNULL,
+	}); err != nil {
+		t.Fatalf("null cipher without encryption key should be accepted: %v", err)
+	}
+}

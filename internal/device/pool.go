@@ -231,6 +231,9 @@ func NewPool(cfg *config.Config) *Pool {
 	p.transportRecovery = NewTransportRecoveryController(p)
 	p.voWiFiHost().ConfigureAdapter(p)
 	p.voWiFiHost().ConfigureRuntimeDependencies(p.GetVoiceGateway(), vowifiDeliveryStore{}, poolVoWiFiRuntimeDispatcher{pool: p})
+	if cfg != nil {
+		p.voWiFiHost().SetSIPTransport(cfg.VoWiFi.SIPTransport)
+	}
 
 	return p
 }

@@ -719,8 +719,8 @@ func TestDefaultTunnelManagerForStartEnablesTUNRoutingProtection(t *testing.T) {
 	if tunManager.Config.TUN.Name != "vohive0" || tunManager.Config.MTU != 1420 {
 		t.Fatalf("tun config=%+v mtu=%d", tunManager.Config.TUN, tunManager.Config.MTU)
 	}
-	if !tunManager.Config.DefaultRoutes || !tunManager.Config.ProtectEPDGRoutes {
-		t.Fatalf("default route/protect flags = %t/%t", tunManager.Config.DefaultRoutes, tunManager.Config.ProtectEPDGRoutes)
+	if !tunManager.Config.ScopedRoutes || tunManager.Config.DefaultRoutes || !tunManager.Config.ProtectEPDGRoutes {
+		t.Fatalf("scoped=%t default=%t protect=%t, want scoped+protect without default", tunManager.Config.ScopedRoutes, tunManager.Config.DefaultRoutes, tunManager.Config.ProtectEPDGRoutes)
 	}
 	ikeManager, ok := tunManager.Config.Base.(*swu.IKEPacketTunnelManager)
 	if !ok {

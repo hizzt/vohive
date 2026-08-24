@@ -26,8 +26,15 @@ func debugTraceNoMatch(dir string, p parsedIP, policy *Policy) {
 
 const (
 	ipProtoTCP uint8 = 6
+	ipProtoUDP uint8 = 17
 	ipProtoESP uint8 = 50
 )
+
+// isSIPTransport 判定承载 SIP 的传输协议——ipsec-3gpp 选择器只对
+// TCP/UDP 封装（TCP=现役 Vodafone 路径，UDP=部分运营商 P-CSCF 仅 UDP）。
+func isSIPTransport(proto uint8) bool {
+	return proto == ipProtoTCP || proto == ipProtoUDP
+}
 
 // Transform 对完整 IP 包做 ESP transport-mode 加解密（IMS ipsec-3gpp 数据面）。
 // Install 之前完全透传；Install 后仅命中 port-c/port-s 选择器的 TCP 包被封装，
@@ -123,13 +130,15 @@ func flowOutboundSA(flow Flow) (*esp.SA, error) {
 	if err != nil {
 		return nil, err
 	}
+	cipher, blockSize := espCipher(flow.EncAlg)
 	return esp.NewSA(esp.SA{
 		SPI:              flow.OutboundSPI,
 		EncryptionKey:    encKey,
 		IntegrityKey:     authKey,
 		Integrity:        espIntegrity(flow.AuthAlg),
+		Cipher:           cipher,
 		ICVLength:        12,
-		BlockSize:        16,
+		BlockSize:        blockSize,
 		ReplayWindowSize: 0, // UE→P-CSCF 出向无需防重放窗口
 	})
 }
@@ -139,13 +148,15 @@ func flowInboundSA(flow Flow) (*esp.SA, error) {
 	if err != nil {
 		return nil, err
 	}
+	cipher, blockSize := espCipher(flow.EncAlg)
 	return esp.NewSA(esp.SA{
 		SPI:              flow.InboundSPI,
 		EncryptionKey:    encKey,
 		IntegrityKey:     authKey,
 		Integrity:        espIntegrity(flow.AuthAlg),
+		Cipher:           cipher,
 		ICVLength:        12,
-		BlockSize:        16,
+		BlockSize:        blockSize,
 		ReplayWindowSize: 64,
 	})
 }
@@ -170,6 +181,8 @@ func DeriveSecureChannelKeys(flow Flow) (encKey, authKey []byte, err error) {
 			key[i] = setDESOddParityByte(key[i])
 		}
 		encKey = key
+	case "null":
+		encKey = nil
 	default:
 		return nil, nil, fmt.Errorf("unsupported enc alg %q", flow.EncAlg)
 	}
@@ -208,10 +221,25 @@ func setDESOddParityByte(b byte) byte {
 }
 
 func espIntegrity(alg string) esp.IntegrityAlgorithm {
-	// engine/swu/esp 只实现 SHA1-96/SHA2-256-128。Vodafone UK 实测协商
-	// hmac-sha-1-96（设备日志 Security-Server 实证），MD5-96 分支按 SHA1 处理
-	// 不可达；若他网协商 MD5 需先给 esp 包补 HMAC-MD5-96。
-	return esp.IntegrityHMACSHA1_96
+	switch canonicalAlg(alg) {
+	case "hmac-md5-96":
+		return esp.IntegrityHMACMD5_96
+	default:
+		// hmac-sha-1-96（Vodafone UK 实测协商，设备日志 Security-Server 实证）。
+		return esp.IntegrityHMACSHA1_96
+	}
+}
+
+func espCipher(alg string) (esp.EncryptionAlgorithm, int) {
+	switch canonicalEAlg(alg) {
+	case "des-ede3-cbc":
+		return esp.Cipher3DESCBC, 8
+	case "null":
+		return esp.CipherNULL, 1
+	default:
+		// aes-cbc（Vodafone UK 实测协商）。
+		return esp.CipherAES128CBC, 16
+	}
 }
 
 // TransformOutbound 对出向 IP 包（UE→P-CSCF）做 ESP transport 封装；未命中透传。
@@ -222,7 +250,7 @@ func (t *Transform) TransformOutbound(packet []byte) ([]byte, error) {
 		return packet, nil
 	}
 	parsed, ok := parseIPPacket(packet)
-	if !ok || parsed.nextHeader != ipProtoTCP {
+	if !ok || !isSIPTransport(parsed.nextHeader) {
 		return packet, nil
 	}
 	var sa *esp.SA
@@ -235,7 +263,7 @@ func (t *Transform) TransformOutbound(packet []byte) ([]byte, error) {
 		debugTraceNoMatch("out", parsed, t.policy)
 		return packet, nil
 	}
-	espPacket, err := sa.Seal(ipProtoTCP, parsed.transport, esp.SealOptions{})
+	espPacket, err := sa.Seal(parsed.nextHeader, parsed.transport, esp.SealOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("imsipsec: seal spi 0x%08x: %w", sa.SPI, err)
 	}
@@ -274,14 +302,14 @@ func (t *Transform) TransformInbound(packet []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("imsipsec: open spi 0x%08x: %w", spi, err)
 	}
-	if open.NextHeader != ipProtoTCP {
+	if !isSIPTransport(open.NextHeader) {
 		return packet, nil
 	}
 	if debugEnabled() {
 		fmt.Fprintf(os.Stderr, "[imsipsec] in matched %s -> %s spi=%08x plain=%dB\n",
 			parsed.src, parsed.dst, spi, len(open.Payload))
 	}
-	return replaceIPPayload(parsed, open.Payload, ipProtoTCP), nil
+	return replaceIPPayload(parsed, open.Payload, open.NextHeader), nil
 }
 
 type parsedIP struct {
@@ -312,7 +340,7 @@ func parseIPPacket(packet []byte) (parsedIP, bool) {
 			dst:        net.IP(append(net.IP(nil), packet[16:20]...)),
 			nextHeader: packet[9],
 		}
-		if out.nextHeader == ipProtoTCP && len(out.transport) >= 4 {
+		if isSIPTransport(out.nextHeader) && len(out.transport) >= 4 {
 			out.srcPort = int(binary.BigEndian.Uint16(out.transport[:2]))
 			out.dstPort = int(binary.BigEndian.Uint16(out.transport[2:4]))
 		}
@@ -328,7 +356,7 @@ func parseIPPacket(packet []byte) (parsedIP, bool) {
 			dst:        net.IP(append(net.IP(nil), packet[24:40]...)),
 			nextHeader: packet[6],
 		}
-		if out.nextHeader == ipProtoTCP && len(out.transport) >= 4 {
+		if isSIPTransport(out.nextHeader) && len(out.transport) >= 4 {
 			out.srcPort = int(binary.BigEndian.Uint16(out.transport[:2]))
 			out.dstPort = int(binary.BigEndian.Uint16(out.transport[2:4]))
 		}

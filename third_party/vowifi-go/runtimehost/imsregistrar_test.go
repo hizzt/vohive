@@ -720,7 +720,6 @@ func TestWireIMSRegistrarRefreshAndCloseAdvanceDigestNonceCount(t *testing.T) {
 			if i == 0 {
 				resp := "SIP/2.0 401 Unauthorized\r\n" +
 					"WWW-Authenticate: " + challenge + "\r\n" +
-					"Security-Server: ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=101;spi-s=202;port-c=5062;port-s=5063\r\n" +
 					"Content-Length: 0\r\n\r\n"
 				_, _ = pc.WriteTo([]byte(resp), addr)
 				continue
@@ -927,4 +926,116 @@ func runtimeBytesFrom(start byte, n int) []byte {
 		out[i] = start + byte(i)
 	}
 	return out
+}
+
+// TestWireIMSRegistrarUDPProtectedPort 验证 UDP 传输下受保护 REGISTER
+// 也切到 Security-Server 宣告的 port-s（部分运营商 P-CSCF 仅 UDP 应答，
+// TS 33.203 port-c/port-s 语义与 TCP 相同）。
+func TestWireIMSRegistrarUDPProtectedPort(t *testing.T) {
+	plainPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(plain) error = %v", err)
+	}
+	defer plainPC.Close()
+	protPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(protected) error = %v", err)
+	}
+	defer protPC.Close()
+
+	rawNonce := append(runtimeBytesFrom(0x20, 16), runtimeBytesFrom(0x50, 16)...)
+	challenge := `Digest realm="ims.example", nonce="` + base64.StdEncoding.EncodeToString(rawNonce) + `", algorithm=AKAv1-MD5, qop="auth"`
+	type seenRequest struct {
+		server string
+		wire   string
+	}
+	seen := make(chan []seenRequest, 4)
+	protAddr := protPC.LocalAddr().String()
+
+	readLoop := func(pc net.PacketConn, server string, replies chan string) {
+		buf := make([]byte, 65535)
+		for {
+			_ = pc.SetReadDeadline(time.Now().Add(3 * time.Second))
+			n, addr, err := pc.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			wire := string(append([]byte(nil), buf[:n]...))
+			seen <- []seenRequest{{server: server, wire: wire}}
+			resp := <-replies
+			_, _ = pc.WriteTo([]byte(resp), addr)
+		}
+	}
+	plainReplies := make(chan string, 1)
+	protReplies := make(chan string, 1)
+	go readLoop(plainPC, "plain", plainReplies)
+	go readLoop(protPC, "protected", protReplies)
+
+	// 首轮：明文 REGISTER → 401（Security-Server 宣告 port-s）。
+	plainReplies <- "SIP/2.0 401 Unauthorized\r\n" +
+		"WWW-Authenticate: " + challenge + "\r\n" +
+		"Security-Server: ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=101;spi-s=202;port-c=5062;port-s=" +
+		strings.Split(protAddr, ":")[1] + "\r\n" +
+		"Content-Length: 0\r\n\r\n"
+	// 次轮：受保护 REGISTER（port-s）→ 200。
+	protReplies <- "SIP/2.0 200 OK\r\n" +
+		"P-Associated-URI: <sip:user@ims.example>\r\n" +
+		"Contact: <sip:user@192.0.2.10:5060>;expires=60\r\n" +
+		"Content-Length: 0\r\n\r\n"
+
+	res, err := WireIMSRegistrar{
+		ServerAddr:            plainPC.LocalAddr().String(),
+		ContactHost:           "192.0.2.10",
+		ContactPort:           5060,
+		Expires:               60,
+		Timeout:               time.Second,
+		MaxRetransmits:        1,
+		RetransmitInterval:    20 * time.Millisecond,
+		MaxRetransmitInterval: 20 * time.Millisecond,
+		DisableKeepalive:      true,
+		CNonce:                "cnonce",
+	}.RegisterIMS(context.Background(), IMSRegistrationConfig{
+		DeviceID: "dev-1",
+		TraceID:  "trace-udp-protected",
+		Profile:  identity.Profile{IMSI: "310280233641503", MCC: "310", MNC: "280"},
+		SIM:      &wireIMSRegistrarSIM{},
+	})
+	if err != nil {
+		t.Fatalf("RegisterIMS() error = %v", err)
+	}
+	if res.StatusCode != 200 {
+		t.Fatalf("status=%d reason=%q", res.StatusCode, res.Reason)
+	}
+	// 注销 REGISTER（Expires: 0）仍走受保护口，预备好 200 应答。
+	protReplies <- "SIP/2.0 200 OK\r\n" +
+		"Contact: <sip:user@192.0.2.10:5060>;expires=0\r\n" +
+		"Content-Length: 0\r\n\r\n"
+	closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := res.Close(closeCtx); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	// 首个请求走明文口，AKA 后的受保护 REGISTER 必须落在 port-s 口。
+	var first, second seenRequest
+	select {
+	case r := <-seen:
+		first = r[0]
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first REGISTER")
+	}
+	select {
+	case r := <-seen:
+		second = r[0]
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for protected REGISTER")
+	}
+	if first.server != "plain" {
+		t.Fatalf("first REGISTER server=%s, want plain", first.server)
+	}
+	if second.server != "protected" {
+		t.Fatalf("second REGISTER server=%s, want protected (port-s)", second.server)
+	}
+	if !strings.Contains(second.wire, "nc=00000001") {
+		t.Fatalf("protected REGISTER lacks digest nc: %s", second.wire[:min(120, len(second.wire))])
+	}
 }
