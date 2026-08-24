@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/iniwex5/vowifi-go/engine/swu/esp"
 	"github.com/iniwex5/vowifi-go/engine/swu/ikev2"
@@ -208,11 +210,14 @@ func TestPacketSessionCountsTransportFailure(t *testing.T) {
 }
 
 type captureESPPacketTransport struct {
+	mu      sync.Mutex
 	packets [][]byte
 	closed  bool
 }
 
 func (t *captureESPPacketTransport) SendESPPacket(ctx context.Context, packet []byte) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.packets = append(t.packets, append([]byte(nil), packet...))
 	return nil
 }
@@ -349,4 +354,154 @@ func TestReadInnerPacketDropsReplayWithoutKillingSession(t *testing.T) {
 	if !bytes.Equal(got.Payload, []byte{0x45, 0x00, 0x00, 0x15}) {
 		t.Fatalf("payload=%x（应丢弃重放包读到新包）", got.Payload)
 	}
+}
+
+// withShrunkLiveness 时限压缩到测试可等的时间量级。
+func withShrunkLiveness(t *testing.T) {
+	t.Helper()
+	oldInterval, oldThreshold, oldTimeout, oldMax := livenessProbeInterval, livenessIdleProbeThreshold, livenessProbeTimeout, livenessMaxProbeFailures
+	livenessProbeInterval = 40 * time.Millisecond
+	livenessIdleProbeThreshold = 120 * time.Millisecond
+	livenessProbeTimeout = 200 * time.Millisecond
+	livenessMaxProbeFailures = 3
+	t.Cleanup(func() {
+		livenessProbeInterval = oldInterval
+		livenessIdleProbeThreshold = oldThreshold
+		livenessProbeTimeout = oldTimeout
+		livenessMaxProbeFailures = oldMax
+	})
+}
+
+// 空闲（无下行）但未到升级阈值：只发 NAT-T 单字节，不发 ESP 主动探测。
+func TestLivenessIdleSendsOnlyNATTKkeepalive(t *testing.T) {
+	withShrunkLiveness(t)
+	transport := &captureESPPacketTransport{}
+	session, err := NewPacketSession(PacketSessionConfig{
+		ChildSA:         packetChildSA(true),
+		Transport:       transport,
+		Result:          TunnelResult{Ready: true, IKEEstablished: true, IPsecEstablished: true},
+		LivenessHandler: func(context.Context) error { return nil },
+	})
+	if err != nil {
+		t.Fatalf("NewPacketSession() error = %v", err)
+	}
+	defer session.Close(context.Background())
+	// 拉长空闲（绕过升级阈值）：只允许 NAT-T，不允许 ESP 探测出站。
+	session.mu.Lock()
+	session.lastInbound = time.Now().Add(-livenessIdleProbeThreshold * 10)
+	session.mu.Unlock()
+	session.StartLivenessLoop(context.Background())
+	deadline := time.Now().Add(400 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		transport.mu.Lock()
+		n := len(transport.packets)
+		transport.mu.Unlock()
+		if n > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(transport.packets) == 0 {
+		t.Fatal("NAT-T keepalive 未发出")
+	}
+	for _, p := range transport.packets {
+		if len(p) != 1 || p[0] != 0xff {
+			t.Fatalf("空闲未到阈值时出现了非 NAT-T 出站包: %x", p)
+		}
+	}
+}
+
+// 有持续下行流量：零保活出站（不发 NAT-T 也不发探测）。
+func TestLivenessQuietWhenTrafficFlows(t *testing.T) {
+	withShrunkLiveness(t)
+	transport := &captureESPPacketTransport{}
+	session, err := NewPacketSession(PacketSessionConfig{
+		ChildSA:         packetChildSA(true),
+		Transport:       transport,
+		Result:          TunnelResult{Ready: true, IKEEstablished: true, IPsecEstablished: true},
+		LivenessHandler: func(context.Context) error { return nil },
+	})
+	if err != nil {
+		t.Fatalf("NewPacketSession() error = %v", err)
+	}
+	defer session.Close(context.Background())
+	session.StartLivenessLoop(context.Background())
+	// 模拟持续下行刷新 lastInbound。
+	stop := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				session.mu.Lock()
+				session.lastInbound = time.Now()
+				session.mu.Unlock()
+				time.Sleep(5 * time.Millisecond)
+			}
+		}
+	}()
+	time.Sleep(300 * time.Millisecond)
+	close(stop)
+	if n := len(transport.packets); n != 0 {
+		t.Fatalf("有下行流量时应零保活出站, got %d 包", n)
+	}
+}
+
+// 持续无下行且探测一直失败：连续失败达到阈值才拆链。
+func TestLivenessTearsDownAfterConsecutiveFailures(t *testing.T) {
+	withShrunkLiveness(t)
+	transport := &captureESPPacketTransport{}
+	session, err := NewPacketSession(PacketSessionConfig{
+		ChildSA: packetChildSA(true),
+		Transport: &livenessFailTransport{
+			inner:   transport,
+			failFor: func(b []byte) bool { return len(b) != 1 || b[0] != 0xff },
+		},
+		Result:          TunnelResult{Ready: true, IKEEstablished: true, IPsecEstablished: true, RemoteInnerIP: "192.0.2.1", LocalInnerIP: "192.0.2.9"},
+		LivenessHandler: func(context.Context) error { return errors.New("dpd dead") },
+	})
+	if err != nil {
+		t.Fatalf("NewPacketSession() error = %v", err)
+	}
+	session.mu.Lock()
+	session.lastInbound = time.Now().Add(-livenessIdleProbeThreshold * 10)
+	session.mu.Unlock()
+	session.StartLivenessLoop(context.Background())
+	// livenessMaxProbeFailures=3 + 升级阈值前有若干 NAT-T tick，1.2s 足够收敛。
+	deadline := time.Now().Add(1200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if session.closed {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	session.mu.Lock()
+	closed := session.closed
+	session.mu.Unlock()
+	if !closed {
+		t.Fatal("连续探测失败达到阈值后应拆链")
+	}
+}
+
+// livenessFailTransport 只让 NAT-T 单字节包通过，其余（ESP 探测）全部失败，
+// 用来制造"链路只能发不能收应答"的死链。
+type livenessFailTransport struct {
+	inner   *captureESPPacketTransport
+	failFor func([]byte) bool
+}
+
+func (t *livenessFailTransport) SendESPPacket(ctx context.Context, packet []byte) error {
+	if t.failFor(packet) {
+		return errors.New("link dead for probes")
+	}
+	return t.inner.SendESPPacket(ctx, packet)
+}
+
+func (t *livenessFailTransport) ReadESPPacket(ctx context.Context) ([]byte, error) {
+	return t.inner.ReadESPPacket(ctx)
+}
+
+func (t *livenessFailTransport) Close(ctx context.Context) error {
+	return t.inner.Close(ctx)
 }

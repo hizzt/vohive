@@ -122,17 +122,26 @@ func (s *PacketSession) SetOnPSCFRestore(fn func(newPSCF string)) {
 	}
 }
 
-// livenessProbeInterval 是 DPD 探测间隔；livenessProbeTimeout 是单次探测超时。
-// 间隔取 20s。设备对照实验结论（08-22）：伦敦代理差时段的 relay 下行回收
-// 是 ~7.5min 的硬性生命周期，与流量密度无关（10s 间隔=4 倍密度仍 7.5min
-// 整死亡；DPD 平时秒回、死亡点突然全断）——收紧间隔无收益只增流量，故
-// 维持 20s；好时段（阈值宽松）20s 探测的双向流可维持 69min 会话。
-// livenessMaxProbeFailures 是连续探测失败判死阈值：单次失败即拆链会被
-// 代理偶发丢包误杀（对齐 Python 参考 DPD 4 次重试的容错语义）。
-const (
-	livenessProbeInterval    = 20 * time.Second
-	livenessProbeTimeout     = 90 * time.Second
-	livenessMaxProbeFailures = 3
+// livenessProbeInterval 是 NAT-T keepalive 发送间隔（对齐 v1.5.5 实测：
+// 20s 一条 11B 0xff——同一代理上零业务流量也能维持会话 30min+ 到 rekey）。
+// livenessIdleProbeThreshold 是"无下行流量"的升级阈值：空闲超过它才发
+// 主动探测（ICMP echo/DNS query 经 ESP），避免每 20s 一次 132B 的探测流。
+// livenessProbeTimeout 是单次主动探测超时；livenessMaxProbeFailures 是
+// 连续失败判死阈值（5 次≈代理差时段的最长间歇，防止误杀健康会话）。
+//
+// 2026-08-24 对齐决策：v1.5.5 空闲期仅 NAT-T 单字节保活（0.55B/s）在同
+// 代理稳定存活（tcpdump 实测），推翻"必须持续业务流量否则 relay 回收"
+// 的旧结论（该结论来自 08-22 的 IKE DPD 场景，NAT-T 不受影响）。旧的
+// 三层保活（20s ESP 探测 + 30s CRLF + NAT-T）流量高一个数量级且探测走
+// 最贵路径（经代理加密封装），对链路质量过敏（10:37-10:48 代理差时段
+// 3 次连击误拆健康会话）。
+// 用 var 而非 const：测试可改写缩短周期（runtimehost 旧 sipKeepaliveInterval
+// 同款做法）。
+var (
+	livenessProbeInterval      = 20 * time.Second
+	livenessIdleProbeThreshold = 90 * time.Second
+	livenessProbeTimeout       = 90 * time.Second
+	livenessMaxProbeFailures   = 5
 )
 
 type PacketSession struct {
@@ -234,17 +243,26 @@ func (s *PacketSession) StartLivenessLoop(ctx context.Context) {
 				idle := time.Since(s.lastInbound)
 				closed := s.closed
 				s.mu.Unlock()
-				if closed || idle < livenessProbeInterval {
-					consecutiveFailures = 0 // 有下行流量（含对端 keepalive）即视为对端存活
+				if closed {
+					return
+				}
+				if idle < livenessProbeInterval {
+					// 有下行流量即对端存活——什么都不发（零流量空闲）。
+					consecutiveFailures = 0
 					continue
 				}
-				// 保活探测改为 ESP 层：向隧道对端内网关发 ICMP echo（经 ESP
-				// 加密），对端必回 ESP——这是双向 ESP 流量，ePDG/代理链路都
-				// 按 ESP 流维持。设备实测（112+伦敦 SOCKS5）：IKE INFORMATIONAL
-				// 空探测在会话空闲 ~40s 后被 ePDG 无视（1.5.5 同代理 0.2s 秒回
-				// 是因为它有周期 SIP 事务持续维持 ESP 流），而 ESP 层探测在
-				// REGISTER 期间始终秒回。echo 无响应累计连续 3 次才判定链路死
-				// （单次失败即拆链会被代理偶发丢包误杀健康会话）。
+				// 空闲（无下行）：先只发 NAT-T 0xff 单字节维持代理 relay
+				// 映射与 ePDG NAT（v1.5.5 同款，11B/20s）。它不需要响应，
+				// 失败不计数——socket 级错误由 pump 统一判定。
+				keepaliveCtx, keepaliveCancel := context.WithTimeout(ctx, 5*time.Second)
+				_ = s.sendNATTKeepaliveOnly(keepaliveCtx)
+				keepaliveCancel()
+				// 只有持续无下行超过阈值才升级为主动探测（经 ESP 的
+				// ICMP echo/DNS query，双向验证）。频繁探测的旧方案已废
+				// 弃：探测走最贵路径（经代理加密封装），对链路质量过敏。
+				if idle < livenessIdleProbeThreshold {
+					continue
+				}
 				probeCtx, probeCancel := context.WithTimeout(ctx, livenessProbeTimeout)
 				err := s.probeESPKeepalive(probeCtx)
 				probeCancel()

@@ -1262,10 +1262,10 @@ func TestStartReRegisterIMSOnPSCFRestore(t *testing.T) {
 	}
 }
 
-func TestStartSIPKeepaliveLoopSendsOptions(t *testing.T) {
-	oldInterval := sipKeepaliveInterval
-	sipKeepaliveInterval = 20 * time.Millisecond
-	defer func() { sipKeepaliveInterval = oldInterval }()
+// 周期 SIP 保活循环已移除（对齐 v155 零 SIP 保活实证）：注册成功后空闲期
+// 不得再产生任何周期性 SIP 事务（OPTIONS/CRLF），链路维持只靠 NAT-T。
+// 见 packet_session.go 的 liveness 注释与 packet_session_test.go 的对应行为测试。
+func TestStartSendsNoPeriodicSIPKeepalive(t *testing.T) {
 	transport := &runtimeVoiceTransport{}
 	registrar := &testIMSRegistrar{result: IMSRegistrationResult{
 		Registered:     true,
@@ -1283,65 +1283,14 @@ func TestStartSIPKeepaliveLoopSendsOptions(t *testing.T) {
 		t.Fatalf("Start() error = %v", err)
 	}
 	defer inst.Stop(context.Background())
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if len(transport.requests) >= 2 {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
+	time.Sleep(300 * time.Millisecond)
+	if got := len(transport.requests); got != 0 {
+		t.Fatalf("idle transport requests=%d, want 0 (periodic SIP keepalive removed)", got)
 	}
-	if len(transport.requests) < 2 {
-		t.Fatalf("keepalive OPTIONS requests=%d, want >=2", len(transport.requests))
-	}
-	for _, req := range transport.requests {
-		if req.Method != "OPTIONS" {
-			t.Fatalf("keepalive method=%s, want OPTIONS", req.Method)
-		}
-	}
-	// Stop 后停止发送。
-	n := len(transport.requests)
-	deadline = time.Now().Add(300 * time.Millisecond)
+	// Stop 之后同样不得出现。
 	_ = inst.Stop(context.Background())
-	for time.Now().Before(deadline) {
-		if len(transport.requests) > n {
-			t.Fatalf("keepalive continued after Stop (%d > %d)", len(transport.requests), n)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-}
-
-func TestSIPKeepaliveSurvivesTransportErrors(t *testing.T) {
-	oldInterval := sipKeepaliveInterval
-	sipKeepaliveInterval = 20 * time.Millisecond
-	defer func() { sipKeepaliveInterval = oldInterval }()
-	transport := &runtimeVoiceTransport{errors: []error{errors.New("link down"), errors.New("link down"), errors.New("link down")}}
-	registrar := &testIMSRegistrar{result: IMSRegistrationResult{
-		Registered:     true,
-		StatusCode:     200,
-		Reason:         "ims registered",
-		Profile:        voiceclient.IMSProfile{IMPI: "user@ims.example", IMPU: "sip:user@ims.example", Domain: "ims.example"},
-		Binding:        voiceclient.RegistrationBinding{ContactURI: "sip:user@192.0.2.10:5060", PublicIdentity: "sip:user@ims.example"},
-		VoiceTransport: transport,
-	}}
-	inst, err := Start(context.Background(), StartRequest{
-		DeviceID:     "dev-keepalive-err",
-		IMSRegistrar: registrar,
-	})
-	if err != nil {
-		t.Fatalf("Start() error = %v", err)
-	}
-	defer inst.Stop(context.Background())
-	// 失败后循环必须还活着（错误耗尽后 transport 恢复应答 200）。
-	deadline := time.Now().Add(2 * time.Second)
-	sawRecovery := false
-	for time.Now().Before(deadline) {
-		if len(transport.requests) > 3 {
-			sawRecovery = true
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if !sawRecovery {
-		t.Fatalf("keepalive loop died after errors (requests=%d)", len(transport.requests))
+	time.Sleep(100 * time.Millisecond)
+	if got := len(transport.requests); got != 0 {
+		t.Fatalf("post-Stop transport requests=%d, want 0", got)
 	}
 }

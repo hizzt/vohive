@@ -456,7 +456,6 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 		req.VoiceGateway.RegisterAgent(req.DeviceID, inst)
 	}
 	inst.watchPSCFRestore(ctx, pscfRestoreCh)
-	inst.startSIPKeepaliveLoop(ctx)
 	inst.watchTunnelPump()
 	inst.notify(ctx)
 	return inst, nil
@@ -797,73 +796,11 @@ func (i *Instance) recoverIMSRegistration(ctx context.Context, reason string, up
 	return result, true, nil
 }
 
-// sipKeepaliveInterval 是空闲期 SIP OPTIONS 保活间隔。设备对照实证（112+
-// 伦敦 SOCKS5，2026-08-22）：relay 对纯 DPD 流量的会话 ~7.5min 硬回收，但
-// v1.5.5 靠周期 SIP 业务流在同时段存活 35min+——ESP 隧道按业务流量维持。
-// 30s 一条 OPTIONS（无 body 轻事务）复刻该行为；测试可改写缩短周期。
-var sipKeepaliveInterval = 30 * time.Second
-
-// startSIPKeepaliveLoop 周期经 ESP 隧道发 SIP OPTIONS 维持业务流。失败只
-// 记录不动作：链路死活由 ESP liveness(3 次连续失败拆链)统一判定，双系统
-// 各管各的判定权，避免误杀。
-func (i *Instance) startSIPKeepaliveLoop(ctx context.Context) {
-	if i == nil {
-		return
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	stopped := i.stopCh
-	if stopped == nil {
-		return
-	}
-	go func() {
-		ticker := time.NewTicker(sipKeepaliveInterval)
-		defer ticker.Stop()
-		consecutiveFailures := 0
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-stopped:
-				return
-			case <-ticker.C:
-				i.mu.RLock()
-				dead := i.stopped
-				keeper, _ := i.voice.(voicehost.SIPKeepaliveSender)
-				crlfKeeper, _ := i.voice.(voicehost.SIPCRLFKeepaliveSender)
-				i.mu.RUnlock()
-				if dead || (keeper == nil && crlfKeeper == nil) {
-					continue
-				}
-				probeCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-				// CRLF 优先（v155 实证形态，4 字节零事务）；不支持时退 OPTIONS。
-				var err error
-				if crlfKeeper != nil {
-					err = crlfKeeper.SendKeepaliveCRLF(probeCtx)
-				} else {
-					err = keeper.SendKeepaliveOptions(probeCtx)
-				}
-				cancel()
-				if err == nil {
-					consecutiveFailures = 0
-					continue
-				}
-				// ErrIMSVoiceAgentNotReady = agent 尚未就绪（IMS 注册未完
-				// 成等），静默跳过不算失败。
-				if errors.Is(err, voicehost.ErrIMSVoiceAgentNotReady) {
-					continue
-				}
-				consecutiveFailures++
-				// 仅首个失败上报（后续失败静默，避免面板日志刷屏；恢复
-				// 由 liveness 拆链重建兜底）。
-				if consecutiveFailures == 1 {
-					fmt.Fprintf(os.Stderr, "[runtimehost] SIP keepalive failed (%v), muting until recovered\n", err)
-				}
-			}
-		}
-	}()
-}
+// 周期性 SIP 保活（CRLF/OPTIONS 循环）已移除。设备对照实证（112+伦敦
+// SOCKS5，2026-08-24）：v1.5.5 空闲 30min 零 SIP 保活流量仍稳定存活，
+// 链路只靠 NAT-T 0xff（11B/20s）维持；旧三层模型（ESP 探测+CRLF+NAT-T）
+// 空闲流量是 v155 的 ~10 倍且过度敏感。链路死活改由 packet_session 的
+// 被动 liveness 判定（无下行>90s 才探测，5 次失败拆链重建）。
 
 func (i *Instance) recordIMSRecoveryFailure(ctx context.Context, err error) {
 	if i == nil || err == nil {
