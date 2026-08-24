@@ -258,3 +258,95 @@ func packetChildSA(aToB bool) ikev2.ChildSAResult {
 	child.Keys.Inbound = aOutbound
 	return child
 }
+
+// TestReadInnerPacketDropsInvalidWithoutKillingSession 坏包不死会话：
+// ICV 损坏/未知 SPI/重放包是 rekey 过渡期与网络噪声的常态（设备实证
+// 2026-08-24：rekey 后新 SA 首包在旧 SA 视角 ICV 必然失败，曾把 pump
+// 杀掉造成 30min 周期断链）。ReadInnerPacket 必须丢弃坏包继续读到好包，
+// 会话与 pump 都保持存活（RFC 4303 §3.4.3；VoCat 同语义）。
+func TestReadInnerPacketDropsInvalidWithoutKillingSession(t *testing.T) {
+	wire := &captureESPPacketTransport{}
+	a, err := NewPacketSession(PacketSessionConfig{ChildSA: packetChildSA(true), Transport: wire})
+	if err != nil {
+		t.Fatalf("NewPacketSession(a) error = %v", err)
+	}
+	b, err := NewPacketSession(PacketSessionConfig{ChildSA: packetChildSA(false), Transport: wire})
+	if err != nil {
+		t.Fatalf("NewPacketSession(b) error = %v", err)
+	}
+	inner := []byte{0x45, 0x00, 0x00, 0x14, 0xde, 0xad}
+	if err := a.SendInnerPacket(context.Background(), inner); err != nil {
+		t.Fatalf("SendInnerPacket() error = %v", err)
+	}
+	good := append([]byte(nil), wire.packets[0]...)
+	wire.packets = nil
+
+	// 坏包 1：ICV 损坏（篡改尾部 ICV 字节）。
+	corrupt := append([]byte(nil), good...)
+	corrupt[len(corrupt)-1] ^= 0xff
+	// 坏包 2：完全伪造字节（长度合法但内容随机）。
+	forged := make([]byte, 8+16+16+16)
+	for i := range forged {
+		forged[i] = byte(i * 7)
+	}
+	// 坏包 3：截断包。
+	truncated := append([]byte(nil), good[:len(good)/2]...)
+	wire.packets = append(wire.packets, corrupt, forged, truncated, good)
+
+	got, err := b.ReadInnerPacket(context.Background())
+	if err != nil {
+		t.Fatalf("ReadInnerPacket() after bad packets error = %v（会话应存活）", err)
+	}
+	if got.NextHeader != esp.NextHeaderIPv4 || !bytes.Equal(got.Payload, inner) {
+		t.Fatalf("got=%+v payload=%x（应穿透 3 个坏包读到好包）", got, got.Payload)
+	}
+	stats := b.PacketStats()
+	if stats.InboundESPPackets != 1 {
+		t.Fatalf("stats=%+v（只有好包计入）", stats)
+	}
+	if wire.closed {
+		t.Fatalf("会话被误关")
+	}
+}
+
+// TestReadInnerPacketDropsReplayWithoutKillingSession 重放包丢弃后会话存活
+// （此前 ReceiveESPPacket 的 ErrReplay 会冒泡杀 pump）。
+func TestReadInnerPacketDropsReplayWithoutKillingSession(t *testing.T) {
+	transport := &captureESPPacketTransport{}
+	a, err := NewPacketSession(PacketSessionConfig{ChildSA: packetChildSA(true), Transport: transport})
+	if err != nil {
+		t.Fatalf("NewPacketSession(a) error = %v", err)
+	}
+	wire := &captureESPPacketTransport{}
+	b, err := NewPacketSession(PacketSessionConfig{ChildSA: packetChildSA(false), Transport: wire})
+	if err != nil {
+		t.Fatalf("NewPacketSession(b) error = %v", err)
+	}
+	if err := a.SendInnerPacket(context.Background(), []byte{0x45, 0x00, 0x00, 0x14}); err != nil {
+		t.Fatalf("SendInnerPacket() error = %v", err)
+	}
+	packet := transport.packets[0]
+	// 重放同一包两次 + 一个新好包。
+	a2 := a
+	_ = a2
+	if err := a.SendInnerPacket(context.Background(), []byte{0x45, 0x00, 0x00, 0x15}); err != nil {
+		t.Fatalf("SendInnerPacket(2) error = %v", err)
+	}
+	wire.packets = append(wire.packets, packet, packet, transport.packets[1])
+	// 第一次读到原包（首次见到，非重放）。
+	got, err := b.ReadInnerPacket(context.Background())
+	if err != nil {
+		t.Fatalf("ReadInnerPacket(first) error = %v", err)
+	}
+	if !bytes.Equal(got.Payload, []byte{0x45, 0x00, 0x00, 0x14}) {
+		t.Fatalf("payload=%x", got.Payload)
+	}
+	// 第二次读到重放包（丢弃）后穿透到新包——会话存活。
+	got, err = b.ReadInnerPacket(context.Background())
+	if err != nil {
+		t.Fatalf("ReadInnerPacket() after replay error = %v（会话应存活）", err)
+	}
+	if !bytes.Equal(got.Payload, []byte{0x45, 0x00, 0x00, 0x15}) {
+		t.Fatalf("payload=%x（应丢弃重放包读到新包）", got.Payload)
+	}
+}

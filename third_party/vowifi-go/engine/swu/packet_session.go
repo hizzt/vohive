@@ -674,17 +674,26 @@ func (s *PacketSession) ReadInnerPacket(ctx context.Context) (PacketTunnelPacket
 			fmt.Fprintf(os.Stderr, "[swu] ESP open ok: inner %d bytes nextHeader=%d payload=%x\n", len(out.Payload), out.NextHeader, out.Payload[:hexLen])
 		}
 	}
-	if openErr != nil && errors.Is(openErr, esp.ErrInvalidPacket) && isSPIMismatchError(openErr) {
-		// SPI 不匹配的 ESP 包是旧 SA 迟到流量/混流（设备实测 `spi 00000000`
-		// 单包曾把健康会话连着 pump 一起杀掉触发重建），丢弃继续读下一包。
+	if openErr != nil && (errors.Is(openErr, esp.ErrInvalidPacket) || errors.Is(openErr, esp.ErrReplay)) {
+		// 包级校验失败（SPI 不匹配/ICV 不符/重放/长度异常/padding 坏）是不可信
+		// 网络输入——丢包继续读下一包，绝不让单个伪造或迟到数据报拆掉健康
+		// CHILD_SA（RFC 4303 §3.4.3；VoCat userspace_linux.go 同语义，注释
+		// 原文"without allowing a forged datagram to tear down the CHILD_SA"）。
+		// 设备实证（112+伦敦代理，2026-08-24）：CHILD_SA rekey 交换完成后、新 SA
+		// 应用前，对端新 SA 首包（旧 SA 视角 ICV 必然失败）把 pump 杀掉→
+		// 每 30min 周期性断链重建；丢包语义下 rekey 过渡期天然兼容。
+		if !isSPIMismatchError(openErr) {
+			logEvent("WARN", "ESP 入向包校验失败，丢弃（会话保持）", map[string]string{
+				"error": openErr.Error(),
+			})
+		}
 		return s.ReadInnerPacket(ctx)
 	}
 	return out, openErr
 }
 
-// isSPIMismatchError 判断 ESP Open 错误是否为 SPI 不匹配（可丢弃的混流包）。
-// esp.SA.Open 对 SPI 不匹配报 "spi %08x != %08x"，其余（too short/icv/seq）
-// 是真实损坏，交给上层按会话错误处理。
+// isSPIMismatchError 判断 ESP Open 错误是否为 SPI 不匹配（rekey 过渡期的
+// 常态混流，不告警只丢包）。esp.SA.Open 对 SPI 不匹配报 "spi %08x != %08x"。
 func isSPIMismatchError(err error) bool {
 	return err != nil && strings.Contains(err.Error(), ": spi ")
 }
